@@ -110,7 +110,14 @@ def carregar_mercado(desde: date) -> pd.DataFrame:
     cli = _client()
     linhas = _todas_as_linhas(
         cli.table("v_seller_buybox_share").select("*").gte("data", desde.isoformat()),
-        ["data", "plataforma"])
+        # `seller_canonical` como 3º critério não é enfeite: é o que torna a
+        # ordenação ÚNICA. `(data, plataforma)` se repete em toda linha do
+        # mesmo dia/plataforma — sem desempate, paginação por OFFSET/LIMIT
+        # não garante ordem estável entre chamadas sucessivas, e linha pode
+        # sumir ou duplicar na fronteira de página (aqui, 1204 > PAGINA=1000,
+        # cruza página de verdade). `(data, plataforma, seller_canonical)` é
+        # a chave de agrupamento da própria view — de fato única.
+        ["data", "plataforma", "seller_canonical"])
     return _tipar(pd.DataFrame(linhas))
 
 
@@ -122,9 +129,9 @@ def carregar(seller: str, desde: date) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
 
     fato = _tipar(pd.DataFrame(_todas_as_linhas(
         cli.table("seller_offer_daily").select(
-            "data,turno,plataforma,superficie,offer_key,produto,marca,preco,posicao_melhor,"
-            "posicao_mediana,keywords_presente,detentor_buybox,detentor_anterior,"
-            "virou_no_turno,qtd_sellers,tipo_seller,identidade_suspeita"
+            "data,turno,plataforma,superficie,offer_key,marketplace_product_id,produto,marca,"
+            "preco,posicao_melhor,posicao_mediana,keywords_presente,detentor_buybox,"
+            "detentor_anterior,virou_no_turno,qtd_sellers,tipo_seller,identidade_suspeita"
         ).eq("seller_canonical", seller).gte("data", d),
         ["data", "turno", "plataforma", "offer_key"])))
 
@@ -265,8 +272,12 @@ def main() -> None:
                   help="Produtos em que este seller tomou a caixa de outro.")
         c5.metric("Perdidos", perdidos_n,
                   help="Produtos em que outro seller tomou a caixa deste.",
-                  delta=f"{ganhos_n - perdidos_n:+d} no saldo" if (ganhos_n or perdidos_n) else None,
-                  delta_color="normal" if ganhos_n >= perdidos_n else "inverse")
+                  delta=f"{ganhos_n - perdidos_n:+d} no saldo" if (ganhos_n or perdidos_n) else None)
+                  # delta_color fica no padrão "normal" de propósito: saldo
+                  # negativo já pinta vermelho sozinho. "inverse" faria o
+                  # OPOSTO do pretendido — pintaria o pior saldo de verde,
+                  # que é a cor certa só para métrica onde diminuir é bom
+                  # (latência, custo) — não é o caso de perder buy box.
 
     aba1, aba2, aba3, aba4, aba5 = st.tabs([
         "📈 Share de buy box", "🏆 Ganhos e perdas", "🏷️ Marcas e posição",
@@ -341,7 +352,15 @@ def main() -> None:
         if detidos_marca.empty:
             st.info("Sem produto com buy box detida na janela.")
         else:
-            por_marca = (detidos_marca.groupby("marca")["offer_key"]
+            # Conta PRODUTO (marketplace_product_id), não oferta: a mesma
+            # ligação produto+marca pode render mais de uma offer_key ao
+            # longo da janela (a URL canônica muda, ou o produto cai no
+            # degrau de hash em vez do de id) — contar offer_key infla a
+            # marca. Fallback pro offer_key só nas linhas sem id de produto.
+            chave_produto = detidos_marca["marketplace_product_id"].fillna(
+                detidos_marca["offer_key"])
+            por_marca = (detidos_marca.assign(_produto=chave_produto)
+                         .groupby("marca")["_produto"]
                          .nunique().sort_values(ascending=False))
             st.bar_chart(por_marca, height=280)
             sem_buybox_exposta = int(limpo["detentor_buybox"].isna().sum())
@@ -356,8 +375,13 @@ def main() -> None:
         if limpo.empty or limpo["posicao_mediana"].isna().all():
             st.info("Sem dado de posição na janela.")
         else:
+            # median(), não mean(): a coluna já é a mediana POR OFERTA
+            # (entre keywords, dentro de um turno); agregar várias ofertas
+            # com mean() vira "média das medianas", que não é o que o
+            # título promete. median() é o mais próximo que dá pra honrar
+            # o rótulo sem ter a posição bruta por keyword nesta camada.
             pos = (limpo.groupby(["data", "plataforma"])["posicao_mediana"]
-                  .mean().reset_index()
+                  .median().reset_index()
                   .pivot(index="data", columns="plataforma", values="posicao_mediana"))
             st.line_chart(pos, height=280)
             st.caption(
