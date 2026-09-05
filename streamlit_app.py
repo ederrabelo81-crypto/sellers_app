@@ -18,6 +18,13 @@ Pôr uma página de tenant dentro do app interno transformaria o isolamento num
 `WHERE` em Python: um bug de filtro e o Dufrio vê o plano do Frigelar. Aqui a
 fronteira é a chave e a policy, não o código.
 
+Nada aqui é dado privado — tudo é observado-público (§2.3 do documento): a
+vitrine mostra o mesmo preço e o mesmo vencedor de buy box para qualquer
+visitante do marketplace. É por isso que o painel pode nomear e comparar
+concorrentes livremente (aba Ranking) sem violar isolamento nenhum; o dia em
+que houver custo, margem ou estoque do próprio tenant, esse dado nasce em
+outro lugar (o TPS da Fase 2) e nunca entra nesta base.
+
 Rodar local:
     streamlit run streamlit_app.py
 
@@ -25,7 +32,11 @@ Segredos (`.streamlit/secrets.toml` local, ou Settings → Secrets no painel do
 Streamlit Cloud):
     SUPABASE_URL = "https://<projeto>.supabase.co"
     SUPABASE_ANON_KEY = "<chave anon — NUNCA a service_role>"
-    SELLER = "Web Continental"       # trava o painel num seller só
+    SELLER = "Web Continental"       # opcional: trava o painel num seller só.
+                                      # Ausente = seletor livre entre todos os
+                                      # sellers com dado na janela (uso: demo
+                                      # compartilhada). Presente = pensado para
+                                      # uma instância dedicada por tenant.
     SENHA = "<senha da demo>"        # opcional; sem ela o painel fica aberto
 """
 from __future__ import annotations
@@ -48,6 +59,22 @@ def _client():
 
 
 PAGINA = 1000  # teto por chamada do PostgREST; ler além disso exige paginar
+
+# `numeric`/`decimal` do Postgres chega pelo PostgREST como STRING JSON, não
+# número — é assim que a API evita perder precisão de ponto flutuante em
+# coluna de dinheiro. Sem esta conversão, `share.pivot_table(..., aggfunc=
+# "mean")` quebra com "dtype 'str' does not support operation 'mean'" — bug
+# real que chegou a ir para produção porque nenhum teste anterior tocava
+# dado de verdade (o sandbox de desenvolvimento não alcança o Supabase).
+_COLUNAS_NUMERICAS = {"share_buybox_pct", "preco", "posicao_mediana"}
+
+
+def _tipar(df: pd.DataFrame) -> pd.DataFrame:
+    """Converte para número as colunas `numeric` do Postgres, uma vez na
+    borda de entrada — para que nenhum código adiante precise lembrar disso."""
+    for col in _COLUNAS_NUMERICAS & set(df.columns):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
 
 def _todas_as_linhas(consulta, ordenar_por: list[str]) -> list[dict]:
@@ -72,29 +99,66 @@ def _todas_as_linhas(consulta, ordenar_por: list[str]) -> list[dict]:
 
 
 @st.cache_data(ttl=900)
+def carregar_mercado(desde: date) -> pd.DataFrame:
+    """Share de TODOS os sellers na janela, sem filtro por seller.
+
+    Uma única consulta alimenta duas coisas: a lista do seletor (§ picker) e o
+    ranking por plataforma (aba Ranking). É dado público — a mesma vitrine que
+    qualquer visitante do marketplace vê — então nomear e ordenar concorrentes
+    aqui não fura fronteira nenhuma de tenant.
+    """
+    cli = _client()
+    linhas = _todas_as_linhas(
+        cli.table("v_seller_buybox_share").select("*").gte("data", desde.isoformat()),
+        ["data", "plataforma"])
+    return _tipar(pd.DataFrame(linhas))
+
+
+@st.cache_data(ttl=900)
 def carregar(seller: str, desde: date) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Fato do seller, share e cobertura. TTL de 15 min — a coleta é 3x/dia."""
     cli = _client()
     d = desde.isoformat()
 
-    fato = pd.DataFrame(_todas_as_linhas(
+    fato = _tipar(pd.DataFrame(_todas_as_linhas(
         cli.table("seller_offer_daily").select(
             "data,turno,plataforma,superficie,offer_key,produto,marca,preco,posicao_melhor,"
-            "keywords_presente,detentor_buybox,detentor_anterior,virou_no_turno,"
-            "qtd_sellers,identidade_suspeita"
+            "posicao_mediana,keywords_presente,detentor_buybox,detentor_anterior,"
+            "virou_no_turno,qtd_sellers,tipo_seller,identidade_suspeita"
         ).eq("seller_canonical", seller).gte("data", d),
-        ["data", "turno", "plataforma", "offer_key"]))
+        ["data", "turno", "plataforma", "offer_key"])))
 
-    share = pd.DataFrame(_todas_as_linhas(
+    share = _tipar(pd.DataFrame(_todas_as_linhas(
         cli.table("v_seller_buybox_share").select("*")
         .eq("seller_canonical", seller).gte("data", d),
-        ["data", "plataforma"]))
+        ["data", "plataforma"])))
 
     cobertura = pd.DataFrame(_todas_as_linhas(
         cli.table("seller_coverage_daily").select("*").gte("data", d),
         ["data", "turno", "plataforma"]))
 
     return fato, share, cobertura
+
+
+@st.cache_data(ttl=900)
+def carregar_perdidos(seller: str, desde: date) -> pd.DataFrame:
+    """Produtos em que ESTE seller detinha a caixa e outro tomou.
+
+    `seller_offer_daily` só tem linha do DETENTOR (a SERP não mostra
+    perdedor) — por isso "ganhei" já sai de graça filtrando pelas próprias
+    linhas (`detentor_anterior` preenchido nelas). "Perdi" é o espelho: a
+    linha pertence a OUTRO seller, e é ele quem carrega `detentor_anterior`
+    apontando para este. Consulta separada porque o filtro é por uma coluna
+    diferente da que trava o resto da página.
+    """
+    cli = _client()
+    linhas = _todas_as_linhas(
+        cli.table("seller_offer_daily").select(
+            "data,turno,plataforma,seller_canonical,produto,marca,preco"
+        ).eq("detentor_anterior", seller).eq("virou_no_turno", True)
+          .eq("identidade_suspeita", False).gte("data", desde.isoformat()),
+        ["data", "turno", "plataforma"])
+    return _tipar(pd.DataFrame(linhas))
 
 
 def _porta() -> bool:
@@ -114,13 +178,44 @@ def _porta() -> bool:
     return False
 
 
+def _escolher_seller(desde: date) -> tuple[str | None, pd.DataFrame]:
+    """Decide o seller da sessão: travado por secret, ou escolhido na sidebar.
+
+    Retorna também o mercado (todos os sellers) já carregado, para não buscar
+    duas vezes — o ranking da aba própria reusa o mesmo dataframe.
+    """
+    mercado = carregar_mercado(desde)
+    travado = st.secrets.get("SELLER")
+
+    if travado:
+        st.sidebar.caption(f"Instância travada em **{travado}**.")
+        return travado, mercado
+
+    if mercado.empty:
+        st.sidebar.error("Sem sellers com dado na janela selecionada.")
+        return None, mercado
+
+    ranking = (mercado.groupby("seller_canonical")["produtos_detidos"]
+               .sum().sort_values(ascending=False))
+    lista = ranking.index.tolist()
+    padrao = lista.index("Web Continental") if "Web Continental" in lista else 0
+    escolhido = st.sidebar.selectbox(
+        "Seller", lista, index=padrao,
+        help="Todo dado aqui é observado-público — a mesma vitrine que "
+             "qualquer visitante do marketplace vê.")
+    return escolhido, mercado
+
+
 def main() -> None:
     if not _porta():
         return
 
-    seller = st.secrets.get("SELLER", "Web Continental")
     dias = st.sidebar.slider("Janela (dias)", 3, 60, 14)
     desde = date.today() - timedelta(days=dias)
+
+    seller, mercado = _escolher_seller(desde)
+    if not seller:
+        return
 
     st.title(f"Track Position Seller — {seller}")
     st.caption(
@@ -129,6 +224,7 @@ def main() -> None:
     )
 
     fato, share, cobertura = carregar(seller, desde)
+    perdidos = carregar_perdidos(seller, desde)
 
     vazio = fato.empty
     if vazio:
@@ -147,7 +243,7 @@ def main() -> None:
              if not vazio else fato)
 
     if not vazio:
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         if not share.empty:
             ultimo_dia = share["data"].max()
             hoje = share[share["data"] == ultimo_dia]
@@ -163,11 +259,19 @@ def main() -> None:
                       help=f"de {int(universo)} observados")
         c3.metric("Ofertas monitoradas",
                   f"{limpo['offer_key'].nunique():,}".replace(",", "."))
-        viradas = int(limpo["virou_no_turno"].fillna(False).sum())
-        c4.metric("Viradas de buy box", viradas,
-                  help="Produtos em que a caixa trocou de dono entre turnos.")
+        ganhos_n = int(limpo["virou_no_turno"].fillna(False).sum())
+        perdidos_n = len(perdidos)
+        c4.metric("Ganhos de buy box", ganhos_n,
+                  help="Produtos em que este seller tomou a caixa de outro.")
+        c5.metric("Perdidos", perdidos_n,
+                  help="Produtos em que outro seller tomou a caixa deste.",
+                  delta=f"{ganhos_n - perdidos_n:+d} no saldo" if (ganhos_n or perdidos_n) else None,
+                  delta_color="normal" if ganhos_n >= perdidos_n else "inverse")
 
-    aba1, aba2, aba3 = st.tabs(["📈 Share de buy box", "🔄 Viradas", "🩺 Cobertura"])
+    aba1, aba2, aba3, aba4, aba5 = st.tabs([
+        "📈 Share de buy box", "🏆 Ganhos e perdas", "🏷️ Marcas e posição",
+        "🥊 Ranking na plataforma", "🩺 Cobertura",
+    ])
 
     with aba1:
         if share.empty:
@@ -193,20 +297,114 @@ def main() -> None:
             )
 
     with aba2:
-        v = limpo[limpo["virou_no_turno"].fillna(False)]
-        if v.empty:
-            st.info("Nenhuma virada de buy box observada na janela.")
+        col_g, col_p = st.columns(2)
+        col_g.metric("Ganhos na janela", len(limpo[limpo["virou_no_turno"].fillna(False)]))
+        col_p.metric("Perdidos na janela", len(perdidos))
+        st.caption(
+            "Ganhei = tomei a caixa de outro seller. Perdi = outro seller tomou "
+            "a minha. Os dois só existem como EVENTO — a foto de um turno nunca "
+            "mostra \"perdedor\", só quem está com a caixa agora."
+        )
+
+        st.markdown("##### ✅ Produtos que você ganhou")
+        ganhos = limpo[limpo["virou_no_turno"].fillna(False)]
+        if ganhos.empty:
+            st.info("Nenhum ganho de buy box observado na janela.")
         else:
             st.dataframe(
-                v[["data", "turno", "plataforma", "produto", "detentor_anterior",
-                   "preco"]].sort_values("data", ascending=False)
+                ganhos[["data", "turno", "plataforma", "produto", "marca",
+                        "detentor_anterior", "preco"]]
+                .sort_values("data", ascending=False)
                 .rename(columns={
                     "data": "Data", "turno": "Turno", "plataforma": "Plataforma",
-                    "produto": "Produto", "detentor_anterior": "Detinha antes",
-                    "preco": "Preço (R$)"}),
+                    "produto": "Produto", "marca": "Marca",
+                    "detentor_anterior": "Tomou de", "preco": "Preço (R$)"}),
+                use_container_width=True, hide_index=True)
+
+        st.markdown("##### ❌ Produtos que você perdeu")
+        if perdidos.empty:
+            st.info("Nenhuma perda de buy box observada na janela.")
+        else:
+            st.dataframe(
+                perdidos[["data", "turno", "plataforma", "produto", "marca",
+                          "seller_canonical", "preco"]]
+                .sort_values("data", ascending=False)
+                .rename(columns={
+                    "data": "Data", "turno": "Turno", "plataforma": "Plataforma",
+                    "produto": "Produto", "marca": "Marca",
+                    "seller_canonical": "Levou", "preco": "Preço (R$)"}),
                 use_container_width=True, hide_index=True)
 
     with aba3:
+        detidos_marca = limpo[limpo["detentor_buybox"] == True]  # noqa: E712
+        st.markdown("##### Portfólio — produtos detidos por marca")
+        if detidos_marca.empty:
+            st.info("Sem produto com buy box detida na janela.")
+        else:
+            por_marca = (detidos_marca.groupby("marca")["offer_key"]
+                         .nunique().sort_values(ascending=False))
+            st.bar_chart(por_marca, height=280)
+            sem_buybox_exposta = int(limpo["detentor_buybox"].isna().sum())
+            if sem_buybox_exposta:
+                st.caption(
+                    f"⚠️ {sem_buybox_exposta} ofertas ficaram fora deste gráfico: "
+                    "estão em plataformas que não expõem vencedor de buy box na "
+                    "vitrine (Amazon, Casas Bahia)."
+                )
+
+        st.markdown("##### Posição mediana por plataforma")
+        if limpo.empty or limpo["posicao_mediana"].isna().all():
+            st.info("Sem dado de posição na janela.")
+        else:
+            pos = (limpo.groupby(["data", "plataforma"])["posicao_mediana"]
+                  .mean().reset_index()
+                  .pivot(index="data", columns="plataforma", values="posicao_mediana"))
+            st.line_chart(pos, height=280)
+            st.caption(
+                "Quanto menor, melhor — é a posição mediana entre as keywords em "
+                "que a oferta apareceu no turno. Não soma entre plataformas nem "
+                "vira ranking absoluto: é relativa a cada busca."
+            )
+
+        if not limpo.empty and limpo["tipo_seller"].notna().any():
+            st.markdown("##### Como você aparece na vitrine")
+            tipos = limpo["tipo_seller"].value_counts()
+            st.dataframe(
+                tipos.rename_axis("Tipo de seller").reset_index(name="Ofertas"),
+                use_container_width=True, hide_index=True)
+
+    with aba4:
+        plataformas_do_seller = sorted(share["plataforma"].unique()) if not share.empty else []
+        if not plataformas_do_seller or mercado.empty:
+            st.info("Sem ranking disponível — este seller não detém buy box em nenhuma plataforma na janela.")
+        else:
+            ultimo_dia_mercado = mercado["data"].max()
+            st.caption(f"Ranking observado em {ultimo_dia_mercado} — fotografia do último dia da janela.")
+            foto = mercado[mercado["data"] == ultimo_dia_mercado].copy()
+            foto["posicao"] = foto.groupby("plataforma")["share_buybox_pct"] \
+                                   .rank(ascending=False, method="min").astype(int)
+            for plataforma in plataformas_do_seller:
+                bloco = foto[foto["plataforma"] == plataforma].sort_values("posicao")
+                total = len(bloco)
+                linha_seller = bloco[bloco["seller_canonical"] == seller]
+                if linha_seller.empty:
+                    continue
+                minha_posicao = int(linha_seller["posicao"].iloc[0])
+                st.markdown(f"##### {plataforma} — você é **#{minha_posicao} de {total}**")
+                topo = bloco.head(8).copy()
+                if minha_posicao > 8:
+                    topo = pd.concat([topo, linha_seller])
+                topo["Você"] = topo["seller_canonical"].eq(seller).map({True: "✅", False: ""})
+                st.dataframe(
+                    topo[["posicao", "seller_canonical", "Você", "produtos_detidos",
+                          "produtos_universo", "share_buybox_pct"]]
+                    .rename(columns={
+                        "posicao": "#", "seller_canonical": "Seller",
+                        "produtos_detidos": "Com a caixa",
+                        "produtos_universo": "Universo", "share_buybox_pct": "Share %"}),
+                    use_container_width=True, hide_index=True)
+
+    with aba5:
         st.markdown(
             "**Coleta ausente não é mercado vazio.** Turno sem leitura aparece "
             "aqui como não observado, e as células dele ficam fora de todo "
@@ -230,7 +428,7 @@ def main() -> None:
                 st.warning(f"{len(faltantes)} combinações data×plataforma com menos de 3 turnos.")
                 st.dataframe(faltantes, use_container_width=True, hide_index=True)
 
-    suspeitas = int(fato["identidade_suspeita"].sum())
+    suspeitas = int(fato["identidade_suspeita"].sum()) if not vazio else 0
     if suspeitas:
         st.divider()
         st.caption(
