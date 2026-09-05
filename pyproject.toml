@@ -1,11 +1,13 @@
 [project]
-name = "blank-app-template"
+name = "track-position-seller"
 version = "0.1.0"
-description = "A simple Streamlit app template."
+description = "Track Position Seller — painel do lojista (buy box, posição, cobertura)."
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
     "streamlit>=1.61.1",
+    "supabase>=2.4",
+    "pandas>=2.0",
 ]
 
 [tool.uv]
