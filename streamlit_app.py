@@ -323,16 +323,16 @@ def main() -> None:
             c1.metric("Share de buy box", f"{pct:.1f}%",
                       help=f"{int(detidos)} de {int(universo)} produtos com buy box "
                            f"observada em {ultimo_dia}, somando as plataformas.")
-            c2.metric("Produtos com a caixa", int(detidos),
+            c2.metric("Produtos com a BB", int(detidos),
                       help=f"de {int(universo)} observados")
         c3.metric("Ofertas monitoradas",
                   f"{limpo['offer_key'].nunique():,}".replace(",", "."))
         ganhos_n = int(limpo["virou_no_turno"].fillna(False).sum())
         perdidos_n = len(perdidos)
         c4.metric("Ganhos de buy box", ganhos_n,
-                  help="Produtos em que este seller tomou a caixa de outro.")
+                  help="Produtos em que este seller tomou a BB de outro.")
         c5.metric("Perdidos", perdidos_n,
-                  help="Produtos em que outro seller tomou a caixa deste.",
+                  help="Produtos em que outro seller tomou a BB deste.",
                   delta=f"{ganhos_n - perdidos_n:+d} no saldo" if (ganhos_n or perdidos_n) else None)
                   # delta_color fica no padrão "normal" de propósito: saldo
                   # negativo já pinta vermelho sozinho. "inverse" faria o
@@ -347,7 +347,7 @@ def main() -> None:
 
     with aba1:
         if share.empty:
-            st.info("Sem share no período — nenhum produto seu detinha a caixa.")
+            st.info("Sem share no período — nenhum produto seu detinha a BB.")
         else:
             pivo = share.pivot_table(index="data", columns="plataforma",
                                      values="share_buybox_pct", aggfunc="mean")
@@ -358,14 +358,14 @@ def main() -> None:
                      "share_buybox_pct"]
                 ].rename(columns={
                     "data": "Data", "plataforma": "Plataforma",
-                    "produtos_detidos": "Com a caixa",
+                    "produtos_detidos": "Com a BB",
                     "produtos_universo": "Universo observado",
                     "share_buybox_pct": "Share %"}),
                 use_container_width=True, hide_index=True)
             st.caption(
                 "O denominador é o universo de produtos **observados** na "
                 "plataforma, não as suas linhas. Sobre as suas linhas o número "
-                "daria sempre 100%: a vitrine só mostra quem detém a caixa."
+                "daria sempre 100%: a vitrine só mostra quem detém a BB."
             )
 
     with aba2:
@@ -373,9 +373,9 @@ def main() -> None:
         col_g.metric("Ganhos na janela", len(limpo[limpo["virou_no_turno"].fillna(False)]))
         col_p.metric("Perdidos na janela", len(perdidos))
         st.caption(
-            "Ganhei = tomei a caixa de outro seller. Perdi = outro seller tomou "
+            "Ganhei = tomei a BB de outro seller. Perdi = outro seller tomou "
             "a minha. Os dois só existem como EVENTO — a foto de um turno nunca "
-            "mostra \"perdedor\", só quem está com a caixa agora."
+            "mostra \"perdedor\", só quem está com a BB agora."
         )
 
         st.markdown("##### ✅ Produtos que você ganhou")
@@ -423,6 +423,14 @@ def main() -> None:
             por_marca = (detidos_marca.assign(_produto=chave_produto)
                          .groupby("marca")["_produto"]
                          .nunique().sort_values(ascending=False))
+            # `st.bar_chart` roda em cima do Vega-Lite, que ordena eixo
+            # nominal/ordinal ALFABETICAMENTE por padrão — ignora a ordem do
+            # `sort_values` acima. Índice como categórico ORDENADO é o único
+            # jeito de fixar no gráfico a ordem decrescente que o pandas já
+            # calculou (testado contra a versão exata do deploy: sem isto o
+            # spec sai com `"sort": None` e as barras voltam para A→Z).
+            ordem = pd.CategoricalDtype(categories=por_marca.index, ordered=True)
+            por_marca.index = por_marca.index.astype(ordem)
             st.bar_chart(por_marca, height=280)
             sem_buybox_exposta = int(limpo["detentor_buybox"].isna().sum())
             if sem_buybox_exposta:
@@ -485,7 +493,7 @@ def main() -> None:
                           "produtos_universo", "share_buybox_pct"]]
                     .rename(columns={
                         "posicao": "#", "seller_canonical": "Seller",
-                        "produtos_detidos": "Com a caixa",
+                        "produtos_detidos": "Com a BB",
                         "produtos_universo": "Universo", "share_buybox_pct": "Share %"}),
                     use_container_width=True, hide_index=True)
 
