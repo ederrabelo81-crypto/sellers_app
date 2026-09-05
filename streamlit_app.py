@@ -77,6 +77,35 @@ def _tipar(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# As colunas pedidas ao PostgREST, uma vez só: o mesmo texto vai no `select()`
+# e no esqueleto do dataframe vazio, para os dois não divergirem em silêncio.
+_SELECT_FATO = (
+    "data,turno,plataforma,superficie,offer_key,marketplace_product_id,produto,marca,"
+    "preco,posicao_melhor,posicao_mediana,keywords_presente,detentor_buybox,"
+    "detentor_anterior,virou_no_turno,qtd_sellers,tipo_seller,identidade_suspeita"
+)
+_SELECT_PERDIDOS = "data,turno,plataforma,seller_canonical,produto,marca,preco"
+
+
+def _quadro(linhas: list[dict], select: str) -> pd.DataFrame:
+    """DataFrame que carrega o ESQUEMA mesmo quando não veio nenhuma linha.
+
+    `pd.DataFrame([])` não tem zero linhas: tem zero linhas **e zero
+    colunas**. Todo `df["coluna"]` adiante vira `KeyError`, e no Streamlit
+    isso não é uma tabela vazia na tela — é a página inteira morrendo antes
+    de renderizar. Foi o que aconteceu quando o `SELLER` do secrets passou a
+    nomear uma grafia que a canonização aposentou: a consulta voltava vazia,
+    o aviso "sem oferta registrada" era escrito, e a linha seguinte derrubava
+    o app com `KeyError: 'virou_no_turno'` — as abas que o aviso prometia
+    ("a de Cobertura diz qual dos dois") nunca chegavam a existir.
+
+    Declarar as colunas resolve na borda de entrada, como o `_tipar`: com a
+    lista vazia o pandas materializa o esqueleto, e com linhas ele fixa
+    ordem e conjunto — a resposta do PostgREST nunca contradiz o `select`.
+    """
+    return pd.DataFrame(linhas, columns=select.split(","))
+
+
 def _todas_as_linhas(consulta, ordenar_por: list[str]) -> list[dict]:
     """Lê a consulta inteira, página a página.
 
@@ -127,13 +156,10 @@ def carregar(seller: str, desde: date) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     cli = _client()
     d = desde.isoformat()
 
-    fato = _tipar(pd.DataFrame(_todas_as_linhas(
-        cli.table("seller_offer_daily").select(
-            "data,turno,plataforma,superficie,offer_key,marketplace_product_id,produto,marca,"
-            "preco,posicao_melhor,posicao_mediana,keywords_presente,detentor_buybox,"
-            "detentor_anterior,virou_no_turno,qtd_sellers,tipo_seller,identidade_suspeita"
-        ).eq("seller_canonical", seller).gte("data", d),
-        ["data", "turno", "plataforma", "offer_key"])))
+    fato = _tipar(_quadro(_todas_as_linhas(
+        cli.table("seller_offer_daily").select(_SELECT_FATO)
+        .eq("seller_canonical", seller).gte("data", d),
+        ["data", "turno", "plataforma", "offer_key"]), _SELECT_FATO))
 
     share = _tipar(pd.DataFrame(_todas_as_linhas(
         cli.table("v_seller_buybox_share").select("*")
@@ -160,12 +186,11 @@ def carregar_perdidos(seller: str, desde: date) -> pd.DataFrame:
     """
     cli = _client()
     linhas = _todas_as_linhas(
-        cli.table("seller_offer_daily").select(
-            "data,turno,plataforma,seller_canonical,produto,marca,preco"
-        ).eq("detentor_anterior", seller).eq("virou_no_turno", True)
+        cli.table("seller_offer_daily").select(_SELECT_PERDIDOS)
+        .eq("detentor_anterior", seller).eq("virou_no_turno", True)
           .eq("identidade_suspeita", False).gte("data", desde.isoformat()),
         ["data", "turno", "plataforma"])
-    return _tipar(pd.DataFrame(linhas))
+    return _tipar(_quadro(linhas, _SELECT_PERDIDOS))
 
 
 def _porta() -> bool:
@@ -243,6 +268,42 @@ def main() -> None:
             "Isso pode ser ausência real **ou** coleta que não rodou — a aba "
             "**Cobertura** abaixo diz qual dos dois."
         )
+        if st.secrets.get("SELLER"):
+            # TERCEIRA causa possível, que a aba Cobertura NÃO consegue
+            # descartar: instância travada num nome que a canonização
+            # aposentou. O de-para (`utils.seller_names`) colapsa grafias num
+            # canônico — quando "Comprebel" passa a ser variante de
+            # "Bel Micro", ou "GoCompras" de "Denteck", o secret que ainda
+            # nomeia a grafia velha aponta para um seller que deixou de
+            # existir e o PostgREST devolve `[]` com HTTP 200.
+            #
+            # É HIPÓTESE, não diagnóstico, e o texto tem de dizer isso: seller
+            # novo, dia parado e coleta que não rodou produzem exatamente este
+            # mesmo estado. Afirmar "o nome está errado" mandaria o operador
+            # mexer no secret certo. O que não dá é ficar calado — esta é a
+            # única das três causas com conserto fora do banco, e ela não
+            # aparece em lugar nenhum da tela.
+            #
+            # Não dá para estreitar pelo `mercado`: a view sai do próprio
+            # `seller_offer_daily`, então seller ausente do fato está ausente
+            # da view por construção — a checagem seria sempre verdadeira e
+            # não separaria nada. Quem separa de fato é a aba Cobertura, para
+            # as outras duas causas.
+            st.info(
+                f"**Se a coleta rodou** (veja a aba Cobertura), sobra conferir o "
+                f"nome. Esta instância está travada em **{seller}** pelo secret "
+                "`SELLER`, comparado **literalmente** com `seller_canonical` — e "
+                "a canonização aposenta grafias: quando uma vira variante de "
+                "outra, o canônico muda e o secret velho passa a apontar para um "
+                "seller que não existe mais, sem erro nenhum na resposta."
+            )
+            if not mercado.empty:
+                nomes = (mercado.groupby("seller_canonical")["produtos_detidos"]
+                         .sum().sort_values(ascending=False).index.tolist())
+                st.caption(
+                    "Sellers com buy box observada na janela: "
+                    + ", ".join(f"`{n}`" for n in nomes[:15])
+                    + (f" … e mais {len(nomes) - 15}." if len(nomes) > 15 else "."))
 
     # ── Só marketplace entra em KPI. Loja própria o lojista joga sozinho, e
     #    identidade suspeita é chave colapsada: nem numerador, nem denominador.
