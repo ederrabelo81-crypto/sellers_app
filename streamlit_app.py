@@ -313,8 +313,15 @@ def main() -> None:
     if not vazio:
         c1, c2, c3, c4, c5 = st.columns(5)
         if not share.empty:
-            ultimo_dia = share["data"].max()
-            hoje = share[share["data"] == ultimo_dia]
+            # Foto do último dia observado POR PLATAFORMA, não o max() global de
+            # `data`. A Amazon é coletada num pipeline à parte (GitHub Actions,
+            # buy box via PDP) e materializa com atraso: o último dia do mercado
+            # costuma vir de outra plataforma já um dia à frente, e ancorar tudo
+            # nesse dia único apagava a Amazon do KPI (o sintoma "Amazon não
+            # aparece"). Cada plataforma no seu próprio último dia mantém a
+            # Amazon visível mesmo defasada.
+            ultimo_por_plat = share.groupby("plataforma")["data"].transform("max")
+            hoje = share[share["data"] == ultimo_por_plat]
             detidos, universo = hoje["produtos_detidos"].sum(), hoje["produtos_universo"].sum()
             # Share real = soma/soma. A média dos percentuais por plataforma
             # daria outro número quando os universos diferem (Magalu 661 x
@@ -322,7 +329,7 @@ def main() -> None:
             pct = 100.0 * detidos / universo if universo else 0.0
             c1.metric("Share de buy box", f"{pct:.1f}%",
                       help=f"{int(detidos)} de {int(universo)} produtos com buy box "
-                           f"observada em {ultimo_dia}, somando as plataformas.")
+                           "observada no último dia de cada plataforma.")
             c2.metric("Produtos com a BB", int(detidos),
                       help=f"de {int(universo)} observados")
         c3.metric("Ofertas monitoradas",
@@ -437,7 +444,9 @@ def main() -> None:
                 st.caption(
                     f"⚠️ {sem_buybox_exposta} ofertas ficaram fora deste gráfico: "
                     "estão em plataformas que não expõem vencedor de buy box na "
-                    "vitrine (Amazon, Casas Bahia)."
+                    "vitrine (ex.: Casas Bahia). A Amazon passou a expor via PDP "
+                    "(coletor Amazon-only no GitHub Actions, Set/2026), então já "
+                    "entra aqui."
                 )
 
         st.markdown("##### Posição mediana por plataforma")
@@ -471,9 +480,12 @@ def main() -> None:
         if not plataformas_do_seller or mercado.empty:
             st.info("Sem ranking disponível — este seller não detém buy box em nenhuma plataforma na janela.")
         else:
-            ultimo_dia_mercado = mercado["data"].max()
-            st.caption(f"Ranking observado em {ultimo_dia_mercado} — fotografia do último dia da janela.")
-            foto = mercado[mercado["data"] == ultimo_dia_mercado].copy()
+            # Cada plataforma no seu próprio último dia observado (ver KPI): a
+            # Amazon materializa com atraso e o max() global de `data` a apagava
+            # deste ranking. Assim ela aparece mesmo um dia defasada.
+            ultimo_por_plat = mercado.groupby("plataforma")["data"].transform("max")
+            foto = mercado[mercado["data"] == ultimo_por_plat].copy()
+            st.caption("Fotografia do último dia observado de cada plataforma.")
             foto["posicao"] = foto.groupby("plataforma")["share_buybox_pct"] \
                                    .rank(ascending=False, method="min").astype(int)
             for plataforma in plataformas_do_seller:
@@ -483,7 +495,10 @@ def main() -> None:
                 if linha_seller.empty:
                     continue
                 minha_posicao = int(linha_seller["posicao"].iloc[0])
-                st.markdown(f"##### {plataforma} — você é **#{minha_posicao} de {total}**")
+                dia_plat = bloco["data"].iloc[0]
+                st.markdown(
+                    f"##### {plataforma} — você é **#{minha_posicao} de {total}** "
+                    f"· observado em {dia_plat}")
                 topo = bloco.head(8).copy()
                 if minha_posicao > 8:
                     topo = pd.concat([topo, linha_seller])
