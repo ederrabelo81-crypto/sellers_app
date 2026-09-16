@@ -29,9 +29,24 @@ Rodar local:
     streamlit run streamlit_app.py
 
 Segredos (`.streamlit/secrets.toml` local, ou Settings → Secrets no painel do
-Streamlit Cloud):
-    SUPABASE_URL = "https://<projeto>.supabase.co"
-    SUPABASE_ANON_KEY = "<chave anon — NUNCA a service_role>"
+Streamlit Cloud) — dois bancos possíveis, a fronteira é qual secret existe:
+
+    RAC_DB_DSN = "postgresql://seller_ro:<senha>@<host>.aivencloud.com:<porta>/defaultdb?sslmode=require"
+                                      # preferencial (Set/2026): Postgres na
+                                      # Aiven, usuário `seller_ro` — só SELECT
+                                      # em seller_offer_daily, seller_coverage_
+                                      # daily e v_seller_buybox_share (ver
+                                      # docs/MIGRACAO_AIVEN.md do
+                                      # RAC-Position-tracker). Presente, manda
+                                      # tudo para lá — mesma regra do resto do
+                                      # projeto (`RAC_DB_DSN` como chave de
+                                      # virada, não um `if` espalhado).
+
+    SUPABASE_URL = "https://<projeto>.supabase.co"       # legado — só usado
+    SUPABASE_ANON_KEY = "<chave anon — NUNCA a service_role>"  # se RAC_DB_DSN
+                                      # estiver ausente (banco voltou a caber
+                                      # na cota do free tier).
+
     SELLER = "Web Continental"       # opcional: trava o painel num seller só.
                                       # Ausente = seletor livre entre todos os
                                       # sellers com dado na janela (uso: demo
@@ -41,11 +56,13 @@ Streamlit Cloud):
 """
 from __future__ import annotations
 
+import threading
+from dataclasses import dataclass, field
 from datetime import date, timedelta
+from typing import Any
 
 import pandas as pd
 import streamlit as st
-from supabase import create_client
 
 st.set_page_config(page_title="Track Position Seller", page_icon="📦", layout="wide")
 
@@ -53,8 +70,174 @@ st.set_page_config(page_title="Track Position Seller", page_icon="📦", layout=
 ACENTO, ALERTA, NEUTRO = "#1B6E6A", "#9C5D11", "#56635F"
 
 
+# ── Adaptador Postgres (Aiven) ───────────────────────────────────────────────
+#
+# Em Set/2026 a cota do free tier do Supabase (500 MB) estourou e o PostgREST
+# — a API REST que o `supabase-py` consome — passou a devolver HTTP 402
+# (`exceed_db_size_quota`) em toda leitura, mesmo com o Postgres saudável por
+# trás. O RAC Position Tracker migrou a janela quente para um Postgres na
+# Aiven (`utils/db.py`, `docs/MIGRACAO_AIVEN.md`) por trás de um adaptador que
+# imita a API fluente do `supabase-py` sobre psycopg2 — assim as chamadas
+# `.table().select()...execute()` não mudam, só o transporte.
+#
+# Esta classe é o mesmo adaptador, recortado para o subconjunto que este
+# painel usa (`select/eq/gte/order/range/execute`, só leitura) — o painel é um
+# arquivo único de propósito (deploy no Streamlit Community Cloud), então
+# importar `utils.db` do repositório principal não é opção.
+try:
+    import psycopg2
+    from psycopg2 import sql as _sql
+    from psycopg2.extensions import new_type, register_type
+    from psycopg2.extras import RealDictCursor
+except ImportError:  # pragma: no cover - dependência declarada no pyproject
+    psycopg2 = None
+
+_OID_NUMERIC, _OID_DATE = 1700, 1082
+_OID_TIMESTAMP, _OID_TIMESTAMPTZ = 1114, 1184
+
+
+def _texto_cru(valor, cur):
+    return valor
+
+
+def _texto_iso(valor, cur):
+    return valor.replace(" ", "T", 1) if valor is not None else None
+
+
+def _registrar_tipos_postgrest(conn) -> None:
+    """Faz esta conexão devolver `numeric`/`date`/`timestamp` como texto —
+    exatamente o que o PostgREST entrega. Sem isto o psycopg2 devolveria
+    `Decimal`/`date` nativos e `_tipar()` (que assume string vinda do
+    PostgREST) divergiria em silêncio conforme o backend por trás."""
+    register_type(new_type((_OID_NUMERIC,), "RAC_NUMERIC_TEXTO", _texto_cru), conn)
+    register_type(new_type((_OID_DATE,), "RAC_DATE_TEXTO", _texto_cru), conn)
+    register_type(
+        new_type((_OID_TIMESTAMP, _OID_TIMESTAMPTZ), "RAC_TS_TEXTO", _texto_iso), conn)
+
+
+@dataclass
+class _DBResponse:
+    data: list = field(default_factory=list)
+
+
+_OPS = {"eq": "=", "gte": ">="}
+
+
+class _PostgresQuery:
+    """Réplica mínima da API fluente do `supabase-py` sobre SQL puro."""
+
+    def __init__(self, client: "_PostgresClient", table: str) -> None:
+        self._client = client
+        self._table = table
+        self._columns = "*"
+        self._where: list[Any] = []
+        self._params: list[Any] = []
+        self._order: list[tuple[str, bool]] = []
+        self._limit: int | None = None
+        self._offset: int | None = None
+
+    def select(self, columns: str = "*") -> "_PostgresQuery":
+        self._columns = columns or "*"
+        return self
+
+    def _cmp(self, op: str, column: str, value: Any) -> "_PostgresQuery":
+        self._where.append(
+            _sql.SQL("{} {} %s").format(_sql.Identifier(column), _sql.SQL(_OPS[op])))
+        self._params.append(value)
+        return self
+
+    def eq(self, column: str, value: Any) -> "_PostgresQuery":
+        return self._cmp("eq", column, value)
+
+    def gte(self, column: str, value: Any) -> "_PostgresQuery":
+        return self._cmp("gte", column, value)
+
+    def order(self, column: str, desc: bool = False) -> "_PostgresQuery":
+        self._order.append((column, bool(desc)))
+        return self
+
+    def range(self, start: int, end: int) -> "_PostgresQuery":
+        """Janela inclusiva nos dois extremos, como no PostgREST."""
+        self._offset = int(start)
+        self._limit = int(end) - int(start) + 1
+        return self
+
+    def _columns_sql(self):
+        colunas = self._columns.strip()
+        if colunas in ("", "*"):
+            return _sql.SQL("*")
+        return _sql.SQL(", ").join(
+            _sql.Identifier(c.strip()) for c in colunas.split(",") if c.strip())
+
+    def execute(self) -> _DBResponse:
+        query = (_sql.SQL("SELECT ") + self._columns_sql()
+                 + _sql.SQL(" FROM ") + _sql.Identifier(self._table))
+        if self._where:
+            query += _sql.SQL(" WHERE ") + _sql.SQL(" AND ").join(self._where)
+        if self._order:
+            itens = [_sql.SQL("{} {}").format(
+                _sql.Identifier(c), _sql.SQL("DESC" if d else "ASC"))
+                for c, d in self._order]
+            query += _sql.SQL(" ORDER BY ") + _sql.SQL(", ").join(itens)
+        params = list(self._params)
+        if self._limit is not None:
+            query += _sql.SQL(" LIMIT %s")
+            params.append(self._limit)
+        if self._offset:
+            query += _sql.SQL(" OFFSET %s")
+            params.append(self._offset)
+        return _DBResponse(data=self._client._fetch(query, params))
+
+
+class _PostgresClient:
+    """Uma conexão viva ao Postgres, reconectada sob demanda — mesma forma
+    de uso do `Client` do `supabase-py` (`.table(...)`), só leitura."""
+
+    def __init__(self, dsn: str) -> None:
+        self._dsn = dsn
+        self._conn = None
+        self._lock = threading.RLock()
+
+    def _connection(self):
+        if self._conn is None or self._conn.closed:
+            self._conn = psycopg2.connect(self._dsn, connect_timeout=15)
+            self._conn.autocommit = True
+            _registrar_tipos_postgrest(self._conn)
+        return self._conn
+
+    def _fetch(self, query, params: list[Any]) -> list[dict]:
+        with self._lock:
+            for tentativa in (1, 2):
+                try:
+                    conn = self._connection()
+                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                        cur.execute(query, params)
+                        return [dict(r) for r in cur.fetchall()]
+                except (psycopg2.InterfaceError, psycopg2.OperationalError):
+                    self._conn = None
+                    if tentativa == 2:
+                        raise
+        return []  # inalcançável — a 2ª tentativa sempre retorna ou levanta
+
+    def table(self, name: str) -> _PostgresQuery:
+        return _PostgresQuery(self, name)
+
+
 @st.cache_resource
 def _client():
+    """Backend escolhido pela credencial presente, não por um `if` de app:
+    `RAC_DB_DSN` manda para a Aiven; sem ele, segue no Supabase (legado)."""
+    dsn = st.secrets.get("RAC_DB_DSN", "").strip()
+    if dsn:
+        if psycopg2 is None:
+            raise RuntimeError(
+                "RAC_DB_DSN definido mas psycopg2 não está instalado "
+                "(adicione psycopg2-binary às dependências).")
+        cliente = _PostgresClient(dsn)
+        cliente._fetch(_sql.SQL("SELECT 1"), [])  # falha alto aqui, não na 1ª consulta
+        return cliente
+
+    from supabase import create_client
     return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_ANON_KEY"])
 
 
