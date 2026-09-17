@@ -667,7 +667,7 @@ def render_kpi_cards(share: pd.DataFrame, limpo: pd.DataFrame, perdidos: pd.Data
         "Ganhos de buy box",
         ganhos_n,
         help="Produtos em que este seller tomou a BB de outro.",
-        delta=f"{ganhos_n - (len(limpo[limpo['virou_no_turno'].fillna(False)] // 2) if len(limpo) > 1 else 0):+d}" if ganhos_n > 0 else None
+           delta=f"{ganhos_n - (len(limpo[limpo['virou_no_turno'].fillna(False).astype(bool).to_numpy()]) // 2):.0f}%" if ganhos_n > 0 else None
     )
     
     c5.metric(
