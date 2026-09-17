@@ -1108,7 +1108,13 @@ def main() -> None:
             )
 
     with aba3:
-        detidos_marca = limpo[limpo["detentor_buybox"] == True] if not limpo.empty else pd.DataFrame()  # noqa: E712
+        # `== True` sobre coluna boolean nullable pode virar NA em vez de
+        # False (mesma classe de bug do `virou_no_turno`, já visto travar
+        # a comparação direta) — `.fillna(False).astype(bool)` blinda o
+        # filtro contra isso antes de indexar o DataFrame.
+        mask_bb = ((limpo["detentor_buybox"] == True)  # noqa: E712
+                   .fillna(False).astype(bool).to_numpy()) if not limpo.empty else []
+        detidos_marca = limpo[mask_bb] if not limpo.empty else pd.DataFrame()
         st.markdown("##### Portfólio — produtos detidos por marca")
         if detidos_marca.empty:
             st.info("Sem produto com buy box detida na janela.")
@@ -1120,19 +1126,21 @@ def main() -> None:
             # marca. Fallback pro offer_key só nas linhas sem id de produto.
             chave_produto = detidos_marca["marketplace_product_id"].fillna(
                 detidos_marca["offer_key"])
-            por_marca = (detidos_marca.assign(_produto=chave_produto)
-                         .groupby("marca")["_produto"]
-                         .nunique().sort_values(ascending=False))
-            # `st.bar_chart` roda em cima do Vega-Lite, que ordena eixo
-            # nominal/ordinal ALFABETICAMENTE por padrão — ignora a ordem do
-            # `sort_values` acima. Índice como categórico ORDENADO é o único
-            # jeito de fixar no gráfico a ordem decrescente que o pandas já
-            # calculou (testado contra a versão exata do deploy: sem isto o
-            # spec sai com `"sort": None` e as barras voltam para A→Z).
-            ordem = pd.CategoricalDtype(categories=por_marca.index, ordered=True)
-            por_marca.index = por_marca.index.astype(ordem)
-            
-            # Gráfico de barras com Plotly
+            # `marca` NaN cairia fora do groupby por padrão (dropna=True) e
+            # a marca desapareceria do gráfico sem aviso nenhum — rotular
+            # antes de agrupar mantém o produto visível em vez de sumir.
+            marca = detidos_marca["marca"].fillna("Sem marca informada")
+            por_marca = (detidos_marca.assign(_produto=chave_produto, _marca=marca)
+                         .groupby("_marca")["_produto"]
+                         .nunique().sort_values(ascending=True))
+
+            # Gráfico de barras horizontal com Plotly: ao contrário do
+            # Vega-Lite (usado por `st.bar_chart`, que ordena nominal A→Z
+            # por padrão), o Plotly respeita a ordem de chegada dos dados e
+            # desenha a PRIMEIRA categoria embaixo e a ÚLTIMA em cima — por
+            # isso a série entra em ordem CRESCENTE aqui: a marca com mais
+            # produtos (última) termina no topo, maior→menor de cima pra
+            # baixo, como pedido.
             fig = go.Figure(go.Bar(
                 x=por_marca.values,
                 y=por_marca.index,
@@ -1141,7 +1149,7 @@ def main() -> None:
                 hovertemplate="<b>%{y}</b><br>Produtos: %{x}<extra></extra>",
             ))
             fig.update_layout(
-                height=Config.CHART_HEIGHT_MARCA,
+                height=max(Config.CHART_HEIGHT_MARCA, 28 * len(por_marca)),
                 xaxis_title="Número de Produtos",
                 yaxis_title="Marca",
                 margin=dict(l=150, r=40, t=40, b=40),
