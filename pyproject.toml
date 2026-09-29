@@ -9,7 +9,8 @@ dependencies = [
     "supabase>=2.4",
     "pandas>=2.0",
     "psycopg2-binary>=2.9",
-    "plotly>=5.18.0",
+    "plotly>=5.19.0",
+    "matplotlib>=3.8",
 ]
 
 [tool.uv]
