@@ -12,11 +12,21 @@ MUDANÇAS PRINCIPAIS:
   • KPI cards com deltas temporais
   • Tabelas com formatação condicional
   • Calendar heatmap para cobertura
-  • Gráfico de cascata para ganhos/perdas
   • Detecção automática de anomalias
   • Lazy loading por aba
   • Validação de colunas contra SQL injection
   • Melhorias de acessibilidade (contraste, tooltips)
+
+REVISÃO (Set/2026):
+  • `data` tipada na borda (`_tipar`) — o gráfico de ganhos e perdas saía
+    todo zerado porque agrupava texto e reindexava por Timestamp
+  • Ganhos e perdas: série diária/semanal (dia sem coleta fica vazio, não
+    zero), placar por rival, preço na perda, quebra por turno/plataforma/marca
+  • Marcas e posição: foto de um dia, comparação A → B com o que entrou e
+    saiu, e evolução do mix de marcas
+  • Ranking: sua posição dia a dia e a distância para o líder
+  • Filtro de plataforma único na sidebar, valendo para todas as abas
+  • Paleta validada para daltonismo, cor fixa por plataforma, sem eixo duplo
 
 Este repositório (`sellers_app`) existe só para o deploy no Streamlit
 Community Cloud — o código-fonte e o histórico de decisão vivem em
@@ -77,8 +87,9 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Any, Literal, TypedDict
+from typing import Any, TypedDict
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -138,6 +149,40 @@ class Config:
                 "success": cls.SUCCESS,
                 "danger": cls.DANGER,
             }
+
+        # Paleta categórica dos gráficos — oito matizes numa ordem FIXA,
+        # validada (skill dataviz, `validate_palette.js`) contra as duas
+        # superfícies do Streamlit: separação para daltonismo ΔE ≥ 8 entre
+        # vizinhos e contraste ≥ 3:1 no tema escuro. No claro, três slots
+        # ficam abaixo de 3:1 — por isso todo gráfico tem tabela gêmea.
+        # Um passo por tema, mesma ordem: a cor muda de tom, nunca de dono.
+        CATEGORICA = {
+            "light": ("#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+                      "#e87ba4", "#008300", "#4a3aa7", "#e34948"),
+            "dark": ("#3987e5", "#d95926", "#199e70", "#c98500",
+                     "#d55181", "#008300", "#9085e9", "#e66767"),
+        }
+        # Ganho × perda é POLARIDADE, não identidade: par divergente frio ↔
+        # quente. Verde × vermelho (o par antigo) é justamente o que o
+        # daltônico protan/deutan não separa.
+        GANHO = {"light": "#2a78d6", "dark": "#3987e5"}
+        PERDA = {"light": "#e34948", "dark": "#e66767"}
+        TINTA = {"light": "#52514e", "dark": "#c3c2b7"}   # série derivada
+        OUTRAS = "#898781"                                 # cauda / sem dono
+
+
+# Cor por PLATAFORMA, fixa: a mesma plataforma tem a mesma cor em toda aba e
+# em qualquer filtro (cor segue a entidade, nunca a posição na lista). A ordem
+# é a dos slots validados; Magalu azul, Amazon laranja e Mercado Livre amarelo
+# caem perto da cor da própria marca. Plataforma fora da lista vai para cinza.
+PLATAFORMAS_COR = ("Magalu", "Amazon", "Leroy Merlin", "Mercado Livre",
+                   "Casas Bahia", "Shopee", "Google Shopping")
+
+# Ordem CRONOLÓGICA do turno — espelho de `turno_ordinal()` da migração 017.
+# Alfabeticamente 'Abertura' < 'Fechamento' < 'Tarde'; ordenar pelo texto
+# põe o fechamento das 20h antes da tarde das 14h.
+TURNO_ORDEM = {"abertura": 1, "tarde": 2, "fechamento": 3}
+TURNO_HORA = {1: 8, 2: 14, 3: 20}
 
 
 # ── Type Hints para Schema Enforcement ───────────────────────────────────────
@@ -437,15 +482,72 @@ PAGINA = Config.PAGINA_SIZE
 # "mean")` quebra com "dtype 'str' does not support operation 'mean'" — bug
 # real que chegou a ir para produção porque nenhum teste anterior tocava
 # dado de verdade (o sandbox de desenvolvimento não alcança o Supabase).
-_COLUNAS_NUMERICAS = {"share_buybox_pct", "preco", "posicao_mediana"}
+_COLUNAS_NUMERICAS = {"share_buybox_pct", "preco", "posicao_mediana",
+                      "posicao_melhor", "qtd_sellers", "keywords_presente",
+                      "produtos_detidos", "produtos_universo", "linhas"}
+
+# Booleanos com NULL de verdade (`detentor_buybox` NULL = "plataforma não
+# expõe vencedor", `virou_no_turno` NULL = "sem turno anterior observado").
+# Com NULL no meio o pandas cria coluna `object`, e aí `~coluna` inverte bit
+# de inteiro (~True == -2) e máscara vira índice — daí o dtype `boolean`
+# (nullable) na borda, que guarda o NA sem quebrar a lógica booleana.
+_COLUNAS_BOOLEANAS = {"detentor_buybox", "virou_no_turno",
+                      "identidade_suspeita", "observado"}
 
 
 def _tipar(df: pd.DataFrame) -> pd.DataFrame:
-    """Converte para número as colunas `numeric` do Postgres, uma vez na
-    borda de entrada — para que nenhum código adiante precise lembrar disso."""
+    """Normaliza os tipos do Postgres uma vez, na borda de entrada — para que
+    nenhum código adiante precise lembrar disso.
+
+    `data` vira `datetime64`: tanto o PostgREST quanto o adaptador psycopg2
+    (ver `_registrar_tipos_postgrest`) entregam `date` como TEXTO
+    ('2026-09-01'). Foi isso que zerou o gráfico de ganhos e perdas: a série
+    agrupada por texto era reindexada por `pd.date_range` (Timestamps), nenhum
+    dia casava e todo dia virava 0 — enquanto o KPI, que só conta linhas,
+    mostrava 41 ganhos e 36 perdas na mesma tela.
+    """
     for col in _COLUNAS_NUMERICAS & set(df.columns):
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in _COLUNAS_BOOLEANAS & set(df.columns):
+        df[col] = df[col].astype("boolean")
+    if "data" in df.columns:
+        df["data"] = pd.to_datetime(df["data"], errors="coerce")
     return df
+
+
+def _sim(serie: pd.Series) -> np.ndarray:
+    """Máscara booleana pura: True só onde o valor É True. NA (não observado)
+    vira False — nunca "perdeu", nunca "ganhou"."""
+    return serie.astype("boolean").fillna(False).to_numpy(dtype=bool)
+
+
+def _turno_ord(serie: pd.Series) -> pd.Series:
+    return serie.astype("string").str.strip().str.lower().map(TURNO_ORDEM)
+
+
+def _momento(df: pd.DataFrame) -> pd.Series:
+    """Instante da observação (data + hora do turno) — ordena cronologicamente
+    e permite casar eventos com a observação imediatamente anterior."""
+    horas = _turno_ord(df["turno"]).map(TURNO_HORA).fillna(0).astype(int)
+    return df["data"] + pd.to_timedelta(horas, unit="h")
+
+
+def _fmt_dia(valor) -> str:
+    return pd.Timestamp(valor).strftime("%d/%m/%Y") if pd.notna(valor) else "—"
+
+
+def _tema() -> str:
+    """'dark' ou 'light', do tema ativo no navegador do usuário."""
+    try:
+        return "dark" if st.context.theme.type == "dark" else "light"
+    except Exception:  # pragma: no cover - fora de um script run
+        return "dark"
+
+
+def _cor_plataforma(plataforma: str) -> str:
+    if plataforma in PLATAFORMAS_COR:
+        return Config.Colors.CATEGORICA[_tema()][PLATAFORMAS_COR.index(plataforma)]
+    return Config.Colors.OUTRAS
 
 
 # As colunas pedidas ao PostgREST, uma vez só: o mesmo texto vai no `select()`
@@ -455,7 +557,16 @@ _SELECT_FATO = (
     "preco,posicao_melhor,posicao_mediana,keywords_presente,detentor_buybox,"
     "detentor_anterior,virou_no_turno,qtd_sellers,tipo_seller,identidade_suspeita"
 )
-_SELECT_PERDIDOS = "data,turno,plataforma,seller_canonical,produto,marca,preco"
+# `marketplace_product_id` é o que casa a perda com o MEU último preço no
+# mesmo produto (aba Ganhos e perdas → "Preço na perda").
+# A view e a cobertura são lidas com `select("*")`; o esqueleto abaixo é só
+# o que o painel USA — com zero linhas o quadro ainda tem as colunas (ver
+# `_quadro`), e o filtro de plataforma não morre em KeyError.
+_COLUNAS_SHARE = ("data,plataforma,seller_canonical,produtos_detidos,"
+                  "produtos_universo,share_buybox_pct")
+_COLUNAS_COBERTURA = "data,turno,plataforma,observado,linhas"
+_SELECT_PERDIDOS = ("data,turno,plataforma,seller_canonical,marketplace_product_id,"
+                    "produto,marca,preco")
 
 
 def _quadro(linhas: list[OfferRow], select: str) -> pd.DataFrame:
@@ -508,22 +619,20 @@ def carregar_mercado(desde: date) -> pd.DataFrame:
     aqui não fura fronteira nenhuma de tenant.
     """
     cli = _client()
-    try:
-        linhas = _todas_as_linhas(
-            cli.table("v_seller_buybox_share").select("*").gte("data", desde.isoformat()),
-            # `seller_canonical` como 3º critério não é enfeite: é o que torna a
-            # ordenação ÚNICA. `(data, plataforma)` se repete em toda linha do
-            # mesmo dia/plataforma — sem desempate, paginação por OFFSET/LIMIT
-            # não garante ordem estável entre chamadas sucessivas, e linha pode
-            # sumir ou duplicar na fronteira de página (aqui, 1204 > PAGINA=1000,
-            # cruza página de verdade). `(data, plataforma, seller_canonical)` é
-            # a chave de agrupamento da própria view — de fato única.
-            ["data", "plataforma", "seller_canonical"])
-        return _tipar(pd.DataFrame(linhas))
-    except Exception as e:
-        logger.error(f"Erro ao carregar mercado: {e}")
-        st.error(f"Falha ao carregar dados do mercado: {e}")
-        return pd.DataFrame()
+    linhas = _todas_as_linhas(
+        cli.table("v_seller_buybox_share").select("*").gte("data", desde.isoformat()),
+        # `seller_canonical` como 3º critério não é enfeite: é o que torna a
+        # ordenação ÚNICA. `(data, plataforma)` se repete em toda linha do
+        # mesmo dia/plataforma — sem desempate, paginação por OFFSET/LIMIT
+        # não garante ordem estável entre chamadas sucessivas, e linha pode
+        # sumir ou duplicar na fronteira de página (aqui, 1204 > PAGINA=1000,
+        # cruza página de verdade). `(data, plataforma, seller_canonical)` é
+        # a chave de agrupamento da própria view — de fato única.
+        ["data", "plataforma", "seller_canonical"])
+    # Sem try/except aqui de propósito: exceção NÃO entra no cache do
+    # `st.cache_data`, dataframe vazio entra — e ficaria 15 min dizendo
+    # "sem sellers na janela" depois de uma falha de rede de um segundo.
+    return _tipar(_quadro(linhas, _COLUNAS_SHARE))
 
 
 @st.cache_data(ttl=Config.CACHE_TTL, show_spinner="Carregando dados do seller...")
@@ -538,14 +647,14 @@ def carregar(seller: str, desde: date) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
             .eq("seller_canonical", seller).gte("data", d),
             ["data", "turno", "plataforma", "offer_key"]), _SELECT_FATO))
 
-        share = _tipar(pd.DataFrame(_todas_as_linhas(
+        share = _tipar(_quadro(_todas_as_linhas(
             cli.table("v_seller_buybox_share").select("*")
             .eq("seller_canonical", seller).gte("data", d),
-            ["data", "plataforma"])))
+            ["data", "plataforma"]), _COLUNAS_SHARE))
 
-        cobertura = pd.DataFrame(_todas_as_linhas(
+        cobertura = _tipar(_quadro(_todas_as_linhas(
             cli.table("seller_coverage_daily").select("*").gte("data", d),
-            ["data", "turno", "plataforma"]))
+            ["data", "turno", "plataforma"]), _COLUNAS_COBERTURA))
 
         return fato, share, cobertura
     except Exception as e:
@@ -565,47 +674,136 @@ def carregar_perdidos(seller: str, desde: date) -> pd.DataFrame:
     diferente da que trava o resto da página.
     """
     cli = _client()
-    try:
-        linhas = _todas_as_linhas(
-            cli.table("seller_offer_daily").select(_SELECT_PERDIDOS)
-            .eq("detentor_anterior", seller).eq("virou_no_turno", True)
-              .eq("identidade_suspeita", False).gte("data", desde.isoformat()),
-            ["data", "turno", "plataforma"])
-        return _tipar(_quadro(linhas, _SELECT_PERDIDOS))
-    except Exception as e:
-        logger.error(f"Erro ao carregar perdidos de {seller}: {e}")
-        return pd.DataFrame(columns=_SELECT_PERDIDOS.split(","))
+    linhas = _todas_as_linhas(
+        cli.table("seller_offer_daily").select(_SELECT_PERDIDOS)
+        .eq("detentor_anterior", seller).eq("virou_no_turno", True)
+        .eq("identidade_suspeita", False).gte("data", desde.isoformat()),
+        # A chave primária inteira, para a ordem ser ÚNICA: várias perdas no
+        # mesmo (data, turno, plataforma) cruzariam a fronteira de página em
+        # ordem instável (ver `carregar_mercado`).
+        ["data", "turno", "plataforma", "seller_canonical", "offer_key"])
+    # Falha propaga (não entra no cache): devolver vazio aqui mostraria
+    # "0 perdidos" por 15 minutos — um número errado com cara de bom.
+    return _tipar(_quadro(linhas, _SELECT_PERDIDOS))
+
+
+# ── Recortes derivados ───────────────────────────────────────────────────────
+def _ganhos(limpo: pd.DataFrame) -> pd.DataFrame:
+    """Viradas a favor: este seller tomou a BB de outro no turno."""
+    return limpo[_sim(limpo["virou_no_turno"])]
+
+
+def _detidos(limpo: pd.DataFrame) -> pd.DataFrame:
+    """Linhas em que este seller detinha a BB. NA fica fora: é plataforma que
+    não expõe vencedor (ex.: Casas Bahia), não "perdeu"."""
+    return limpo[_sim(limpo["detentor_buybox"])]
+
+
+def _chave_produto(df: pd.DataFrame) -> pd.Series:
+    """Conta PRODUTO (marketplace_product_id), não oferta: a mesma ligação
+    produto+marca pode render mais de uma offer_key ao longo da janela (a URL
+    canônica muda, ou o produto cai no degrau de hash em vez do de id) —
+    contar offer_key infla a marca. Fallback pro offer_key só nas linhas sem
+    id de produto."""
+    return df["marketplace_product_id"].fillna(df["offer_key"])
+
+
+def _marca(df: pd.DataFrame) -> pd.Series:
+    """`marca` NaN cairia fora do groupby por padrão (dropna=True) e a marca
+    desapareceria do gráfico sem aviso nenhum — rotular antes de agrupar
+    mantém o produto visível em vez de sumir."""
+    return df["marca"].fillna("Sem marca informada")
+
+
+def _brl(valor) -> str:
+    if pd.isna(valor):
+        return "—"
+    return "R$ " + f"{valor:,.2f}".replace(",", "§").replace(".", ",").replace("§", ".")
+
+
+def _pct(valor, sinal: bool = True) -> str:
+    if pd.isna(valor):
+        return "—"
+    return f"{valor:+.1f}%" if sinal else f"{valor:.1f}%"
+
+
+def _com_datas(styler, colunas=("Data", "Observado em")):
+    """Datas no formato brasileiro na tela, sem perder o valor de data por
+    baixo (a ordenação por clique na coluna continua cronológica)."""
+    presentes = [c for c in colunas if c in styler.data.columns]
+    # `subset` é obrigatório: `Styler.format(dict)` sem ele reaplica o
+    # formatador PADRÃO a toda coluna fora do dict — e apagava o "R$" e o
+    # "%" que o chamador já tinha formatado (preço saía `2188.620000`).
+    return styler.format({c: _fmt_dia for c in presentes}, subset=presentes)
+
+
+def _layout(fig: go.Figure, altura: int, hovermode: str = "x unified", **extra) -> go.Figure:
+    """Cromo comum: legenda horizontal acima do gráfico, hover unificado no
+    eixo x, margens enxutas. Grade e fontes vêm do tema do Streamlit."""
+    fig.update_layout(
+        height=altura,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="left", x=0, title_text=""),
+        hovermode=hovermode,
+        **extra,
+    )
+    return fig
+
+
+def _marcar_dias(fig: go.Figure, marcas: dict[str, pd.Timestamp]) -> None:
+    """Linha vertical fina nos dias escolhidos na aba (A/B ou o dia único),
+    para o gráfico de série mostrar ONDE está a foto de cima."""
+    for rotulo, dia in marcas.items():
+        fig.add_vline(x=dia, line_width=1, line_color=Config.Colors.OUTRAS)
+        # Rótulo DENTRO da área do gráfico, colado à linha: acima dela
+        # disputaria espaço com a legenda horizontal.
+        fig.add_annotation(x=dia, y=0.98, yref="paper", text=rotulo, showarrow=False,
+                           yanchor="top", xanchor="left", xshift=3, font=dict(size=11))
 
 
 # ── Detecção de Anomalias ────────────────────────────────────────────────────
-def detectar_anomalias(fato: pd.DataFrame, ganhos: pd.DataFrame, perdidos: pd.DataFrame) -> list[str]:
-    """Detecta anomalias automaticamente e retorna alertas."""
-    alertas = []
-    
-    if fato.empty or "data" not in fato.columns:
-        return alertas
-    
-    # Volatilidade alta de share
-    if "share_buybox_pct" in fato.columns and len(fato) > 3:
-        share_std = fato["share_buybox_pct"].std()
-        if share_std > 20:
-            alertas.append(f"⚠️ Volatilidade alta de share ({share_std:.1f}% > 20%)")
-    
-    # Mais perdas que ganhos (2x)
-    n_ganhos = len(ganhos)
-    n_perdidos = len(perdidos)
+def detectar_anomalias(share: pd.DataFrame, limpo: pd.DataFrame,
+                       ganhos: pd.DataFrame, perdidos: pd.DataFrame) -> list[tuple[str, str]]:
+    """Alertas automáticos como (nível, texto), nível em erro/aviso/info.
+
+    Tudo compara o último dia OBSERVADO com o observado antes dele — dia sem
+    coleta não entra como zero (ver aba Cobertura).
+    """
+    alertas: list[tuple[str, str]] = []
+
+    # Queda de share, por plataforma: somar plataformas misturaria universos
+    # de tamanhos diferentes e esconderia a queda de uma atrás da alta da outra.
+    if not share.empty:
+        for plataforma, bloco in share.sort_values("data").groupby("plataforma"):
+            serie = bloco.set_index("data")["share_buybox_pct"].dropna()
+            if len(serie) >= 2 and serie.iloc[-1] - serie.iloc[-2] <= -5:
+                alertas.append(("aviso",
+                    f"📉 Share em **{plataforma}** caiu "
+                    f"{serie.iloc[-2] - serie.iloc[-1]:.1f} pp em {_fmt_dia(serie.index[-1])} "
+                    f"({serie.iloc[-2]:.1f}% → {serie.iloc[-1]:.1f}%)."))
+
+    n_ganhos, n_perdidos = len(ganhos), len(perdidos)
     if n_perdidos > n_ganhos * 2 and n_perdidos > 0:
-        alertas.append(f"🔴 Mais perdas que ganhos ({n_perdidos} vs {n_ganhos})")
-    
-    # Queda brusca de posição
-    if ("posicao_mediana" in fato.columns and "data" in fato.columns 
-        and not fato["posicao_mediana"].isna().all()):
-        pos_medias = fato.groupby("data")["posicao_mediana"].median()
-        if len(pos_medias) >= 2:
-            ultima_variacao = pos_medias.diff().iloc[-1] if len(pos_medias) > 1 else 0
-            if ultima_variacao > 5:  # piorou mais de 5 posições
-                alertas.append(f"📉 Piora brusca de posição (+{ultima_variacao:.0f})")
-    
+        alertas.append(("erro",
+            f"🔴 Perdas superam ganhos em mais de 2× ({n_perdidos} perdas × {n_ganhos} ganhos)."))
+
+    # Concentração: um rival só levando boa parte das perdas é o sinal mais
+    # acionável da tela — é com ELE que a régua de preço precisa ser revista.
+    if n_perdidos >= 5:
+        top = perdidos["seller_canonical"].value_counts()
+        if top.iloc[0] / n_perdidos >= 0.4:
+            alertas.append(("aviso",
+                f"🥊 **{top.index[0]}** levou {top.iloc[0]} das suas {n_perdidos} perdas "
+                f"({top.iloc[0] / n_perdidos:.0%}) — detalhe na aba Ganhos e perdas."))
+
+    if not limpo.empty and limpo["posicao_mediana"].notna().any():
+        pos = limpo.groupby("data")["posicao_mediana"].median().dropna()
+        if len(pos) >= 2 and pos.iloc[-1] - pos.iloc[-2] > 5:
+            alertas.append(("aviso",
+                f"📉 Posição mediana piorou {pos.iloc[-1] - pos.iloc[-2]:.0f} posições "
+                f"em {_fmt_dia(pos.index[-1])}."))
+
     return alertas
 
 
@@ -614,17 +812,18 @@ def render_kpi_cards(share: pd.DataFrame, limpo: pd.DataFrame, perdidos: pd.Data
     """Renderiza KPI cards com deltas temporais e cores semânticas."""
     if share.empty or limpo.empty:
         return
-    
+
     c1, c2, c3, c4, c5 = st.columns(5)
-    
+
     # Share de buy box com contexto
     ultimo_por_plat = share.groupby("plataforma")["data"].transform("max")
     hoje = share[share["data"] == ultimo_por_plat]
     detidos, universo = hoje["produtos_detidos"].sum(), hoje["produtos_universo"].sum()
     pct = 100.0 * detidos / universo if universo else 0.0
-    
+
     # Calcular período anterior para delta
     periodo_anterior = share[share["data"] < hoje["data"].min()]
+    delta_share = detidos_ant = None
     if not periodo_anterior.empty:
         ult_dia_anterior = periodo_anterior.groupby("plataforma")["data"].transform("max")
         anterior = periodo_anterior[periodo_anterior["data"] == ult_dia_anterior]
@@ -632,44 +831,53 @@ def render_kpi_cards(share: pd.DataFrame, limpo: pd.DataFrame, perdidos: pd.Data
         universo_ant = anterior["produtos_universo"].sum()
         pct_anterior = 100.0 * detidos_ant / universo_ant if universo_ant else 0.0
         delta_share = pct - pct_anterior
-    else:
-        delta_share = None
-    
+
+    ajuda_share = (
+        "**O que é**: percentual de produtos com buy box detida.\n\n"
+        f"**Como calculado**: {int(detidos)} de {int(universo)} produtos.\n\n"
+        "**Período**: último dia observado por plataforma."
+    )
+    if delta_share is not None:
+        ajuda_share += f"\n\n**Variação**: {delta_share:+.1f} pp vs o dia observado anterior."
     c1.metric(
         "Share de buy box",
         f"{pct:.1f}%",
         delta=f"{delta_share:+.1f}pp" if delta_share is not None else None,
-        delta_color="normal" if (delta_share is None or delta_share >= 0) else "inverse",
-        help=f"**O que é**: Percentual de produtos com buy box detida.\n"
-             f"**Como calculado**: {int(detidos)} de {int(universo)} produtos.\n"
-             f"**Período**: Último dia observado por plataforma.\n"
-             f"**Variação**: {delta_share:+.1f}pp vs período anterior" if delta_share else None
+        help=ajuda_share,
     )
-    
+
     c2.metric(
         "Produtos com a BB",
         int(detidos),
         help=f"de {int(universo)} observados",
-        delta=f"{int(detidos) - int(detidos_ant):+d}" if not periodo_anterior.empty else None
+        delta=f"{int(detidos) - int(detidos_ant):+d}" if detidos_ant is not None else None,
     )
-    
+
     c3.metric(
         "Ofertas monitoradas",
         f"{limpo['offer_key'].nunique():,}".replace(",", "."),
         help="Número único de ofertas (URL canônica) monitoradas"
     )
-    
-    ganhos_n = int(limpo["virou_no_turno"].fillna(False).sum())
+
+    ganhos_n = int(_sim(limpo["virou_no_turno"]).sum())
     perdidos_n = len(perdidos)
     saldo = ganhos_n - perdidos_n
-    
+    viradas = ganhos_n + perdidos_n
+    # O delta antigo deste card era `ganhos − ganhos // 2` com um "%" colado
+    # — metade dos ganhos, lida como percentual. Aqui vai um número que
+    # significa algo: de todas as viradas que te envolveram, quantas você
+    # venceu. Acima de 50% você mais toma do que perde.
+    taxa = 100.0 * ganhos_n / viradas if viradas else None
     c4.metric(
         "Ganhos de buy box",
         ganhos_n,
-        help="Produtos em que este seller tomou a BB de outro.",
-           delta=f"{ganhos_n - (len(limpo[limpo['virou_no_turno'].fillna(False).astype(bool).to_numpy()]) // 2):.0f}%" if ganhos_n > 0 else None
+        help="Produtos em que este seller tomou a BB de outro. O percentual é "
+             "a **taxa de vitória nas viradas**: ganhos ÷ (ganhos + perdas).",
+        delta=f"{taxa:.0f}% das viradas" if taxa is not None else None,
+        delta_color="normal" if (taxa or 0) >= 50 else "inverse",
+        delta_arrow="off",
     )
-    
+
     c5.metric(
         "Perdidos",
         perdidos_n,
@@ -679,28 +887,27 @@ def render_kpi_cards(share: pd.DataFrame, limpo: pd.DataFrame, perdidos: pd.Data
     )
 
 
-def render_gráfico_share(share: pd.DataFrame) -> None:
-    """Renderiza gráfico de share com Plotly (interativo, annotations)."""
+def render_aba_share(share: pd.DataFrame) -> None:
+    """Share de buy box por plataforma ao longo da janela."""
     if share.empty:
         st.info("Sem share no período — nenhum produto seu detinha a BB.")
         return
-    
+
     pivo = share.pivot_table(index="data", columns="plataforma",
                              values="share_buybox_pct", aggfunc="mean")
-    
-    fig = make_subplots(specs=[[{"secondary_y": False}]])
-    
-    colors = Config.Colors.palette()
-    for i, plataforma in enumerate(pivo.columns):
-        color = colors["primary"] if plataforma == "Amazon" else None
+
+    fig = go.Figure()
+    for plataforma in pivo.columns:
         fig.add_trace(go.Scatter(
             x=pivo.index,
             y=pivo[plataforma],
             name=plataforma,
-            line=dict(color=color, width=2),
-            hovertemplate=f"<b>{plataforma}</b><br>Data: %{{x}}<br>Share: %{{y:.1f}}%<extra></extra>",
+            mode="lines+markers",
+            line=dict(color=_cor_plataforma(plataforma), width=2),
+            marker=dict(size=6),
+            hovertemplate=f"{plataforma}: %{{y:.1f}}%<extra></extra>",
         ))
-    
+
     # Annotations para eventos importantes
     # Detectar quedas bruscas (>15pp em 1 dia)
     for plataforma in pivo.columns:
@@ -714,44 +921,35 @@ def render_gráfico_share(share: pd.DataFrame) -> None:
                     text="⚠️ Queda",
                     showarrow=True,
                     arrowhead=2,
-                    arrowsize=1,
-                    arrowwidth=2,
-                    arrowcolor=colors["danger"],
-                    bgcolor=colors["warning"],
-                    bordercolor=colors["danger"],
-                    borderwidth=1,
-                    font=dict(color="white", size=10),
+                    arrowcolor=Config.Colors.PERDA[_tema()],
+                    font=dict(size=10),
                 )
-    
-    fig.update_layout(
-        height=Config.CHART_HEIGHT_SHARE,
-        xaxis_title="Data",
-        yaxis_title="Share de Buy Box (%)",
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=40, r=40, t=40, b=40),
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
+
+    _layout(fig, Config.CHART_HEIGHT_SHARE, yaxis_title="Share de buy box (%)")
+    fig.update_xaxes(tickformat="%d/%m")
+    st.plotly_chart(fig, width="stretch")
+
     # Tabela detalhada com formatação condicional
     st.dataframe(
-        share.sort_values(["data", "share_buybox_pct"], ascending=[False, False])[
-            ["data", "plataforma", "produtos_detidos", "produtos_universo",
-             "share_buybox_pct"]
-        ].rename(columns={
-            "data": "Data", "plataforma": "Plataforma",
-            "produtos_detidos": "Com a BB",
-            "produtos_universo": "Universo observado",
-            "share_buybox_pct": "Share %"
-        }).style
-        .background_gradient(subset=["Share %"], cmap="Greens", low=0, high=100)
-        .format({"Share %": "{:.1f}%"})
-        .highlight_max(subset=["Com a BB"], color=colors["primary"] + "33"),
-        use_container_width=True,
+        _com_datas(
+            share.sort_values(["data", "share_buybox_pct"], ascending=[False, False])[
+                ["data", "plataforma", "produtos_detidos", "produtos_universo",
+                 "share_buybox_pct"]
+            ].rename(columns={
+                "data": "Data", "plataforma": "Plataforma",
+                "produtos_detidos": "Com a BB",
+                "produtos_universo": "Universo observado",
+                "share_buybox_pct": "Share %"
+            }).style
+            # vmin/vmax, não low/high: `low`/`high` são FRAÇÕES que esticam a
+            # faixa de cor, e `high=100` comprimia tudo no tom mais claro.
+            .background_gradient(subset=["Share %"], cmap="Greens", vmin=0, vmax=100)
+            .format({"Share %": "{:.1f}%"})
+            .highlight_max(subset=["Com a BB"], color=Config.Colors.PRIMARY + "33")),
+        width="stretch",
         hide_index=True
     )
-    
+
     st.caption(
         "O denominador é o universo de produtos **observados** na "
         "plataforma, não as suas linhas. Sobre as suas linhas o número "
@@ -759,101 +957,720 @@ def render_gráfico_share(share: pd.DataFrame) -> None:
     )
 
 
-def render_ganhos_perdas_cascata(limpo: pd.DataFrame, perdidos: pd.DataFrame) -> None:
-    """Renderiza gráfico de cascata para ganhos e perdas."""
-    if limpo.empty and perdidos.empty:
+# ── Aba Ganhos e perdas ──────────────────────────────────────────────────────
+def _serie_eventos(ganhos: pd.DataFrame, perdidos: pd.DataFrame,
+                   cobertura: pd.DataFrame, desde: date, freq: str) -> pd.DataFrame:
+    """Ganhos e perdas por dia (ou semana) — dia SEM COLETA vira vazio, não 0.
+
+    O gráfico antigo agrupava `data` como texto e reindexava por Timestamp:
+    nenhum dia casava e a série inteira saía zerada. Com `data` tipada na
+    borda (`_tipar`) o reindex casa — e sobra a outra metade do cuidado: um
+    dia em que nenhuma plataforma de buy box foi coletada não teve "zero
+    viradas", teve zero OLHADAS. Esse dia fica NaN (barra ausente).
+    """
+    datas = pd.concat([ganhos["data"], perdidos["data"], cobertura["data"]]).dropna()
+    fim = max(datas.max(), pd.Timestamp(desde)) if not datas.empty else pd.Timestamp(desde)
+    dias = pd.date_range(pd.Timestamp(desde), fim, freq="D")
+    serie = pd.DataFrame({
+        "ganhos": ganhos.groupby("data").size().reindex(dias, fill_value=0),
+        "perdas": perdidos.groupby("data").size().reindex(dias, fill_value=0),
+    }).astype(float)
+
+    # Só as plataformas onde a disputa existe contam como "olhei": dia em
+    # que só a loja própria foi coletada não diz nada sobre viradas.
+    plataformas_bb = set(ganhos["plataforma"]) | set(perdidos["plataforma"])
+    cob = cobertura[cobertura["plataforma"].isin(plataformas_bb)] if plataformas_bb else cobertura
+    if not cob.empty:
+        observados = pd.DatetimeIndex(cob.loc[_sim(cob["observado"]), "data"].unique())
+        serie.loc[~serie.index.isin(observados), ["ganhos", "perdas"]] = np.nan
+
+    if freq == "Semana":
+        serie = serie.resample("W-MON", label="left", closed="left").sum(min_count=1)
+    serie["saldo"] = serie["ganhos"] - serie["perdas"]
+    serie["saldo_acum"] = serie["saldo"].fillna(0).cumsum()
+    return serie
+
+
+def _grafico_eventos(serie: pd.DataFrame, freq: str) -> go.Figure:
+    """Viradas por período (ganho para cima, perda para baixo) e, num painel
+    separado, o saldo acumulado.
+
+    Painel separado, e não um segundo eixo y sobreposto: com dois eixos a
+    posição relativa das duas escalas é arbitrária e o olho lê uma relação
+    entre barra e linha que o dado não tem.
+    """
+    tema = _tema()
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.68, 0.32], vertical_spacing=0.06)
+    fig.add_trace(go.Bar(
+        x=serie.index, y=serie["ganhos"], name="Ganhos",
+        marker_color=Config.Colors.GANHO[tema],
+        hovertemplate="Ganhos: %{y:.0f}<extra></extra>",
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=serie.index, y=-serie["perdas"], name="Perdas",
+        marker_color=Config.Colors.PERDA[tema],
+        customdata=serie["perdas"],
+        hovertemplate="Perdas: %{customdata:.0f}<extra></extra>",
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=serie.index, y=serie["saldo_acum"], name="Saldo acumulado",
+        mode="lines", line=dict(color=Config.Colors.TINTA[tema], width=2),
+        hovertemplate="Saldo acumulado: %{y:+.0f}<extra></extra>",
+    ), row=2, col=1)
+    fig.add_hline(y=0, line_width=1, line_color=Config.Colors.OUTRAS, row=2, col=1)
+
+    # Rótulo direto só no ponto que importa: onde o saldo termina.
+    if not serie.empty:
+        fim = serie["saldo_acum"].iloc[-1]
+        fig.add_annotation(x=serie.index[-1], y=fim, text=f"<b>{fim:+.0f}</b>",
+                           showarrow=False, xanchor="left", xshift=6, row=2, col=1)
+
+    _layout(fig, 460, barmode="relative", bargap=0.25, barcornerradius=4)
+    fig.update_yaxes(title_text="Viradas", row=1, col=1)
+    fig.update_yaxes(title_text="Saldo", row=2, col=1)
+    fig.update_xaxes(tickformat="%d/%m" if freq == "Dia" else "sem. %d/%m", row=2, col=1)
+    return fig
+
+
+def _rivais(ganhos: pd.DataFrame, perdidos: pd.DataFrame,
+            precos: pd.DataFrame) -> pd.DataFrame:
+    """Placar por concorrente: de quem você tomou, quem tomou de você.
+
+    Ganho: `detentor_anterior` da MINHA linha (de quem tomei). Perda:
+    `seller_canonical` da linha do OUTRO (quem levou). Os dois lados já estão
+    carregados — nenhuma consulta nova.
+    """
+    placar = pd.concat([
+        ganhos.groupby("detentor_anterior").size().rename("ganhos"),
+        perdidos.groupby("seller_canonical").size().rename("perdas"),
+    ], axis=1).fillna(0).astype(int)
+    placar.index.name = "rival"
+    placar["saldo"] = placar["ganhos"] - placar["perdas"]
+    placar["total"] = placar["ganhos"] + placar["perdas"]
+    if not precos.empty:
+        placar["gap_mediano"] = precos.groupby("seller_canonical")["gap_pct"].median()
+    else:
+        placar["gap_mediano"] = np.nan
+    return placar.sort_values(["total", "perdas"], ascending=False)
+
+
+def _preco_na_perda(perdidos: pd.DataFrame, limpo: pd.DataFrame) -> pd.DataFrame:
+    """Cada perda ao lado do SEU último preço no mesmo produto antes dela.
+
+    "Quem me tirou a buy box, quando, e por quanto?" (§1.3 do documento do
+    TPS). O preço do rival é o da linha dele no turno da virada; o seu é o da
+    sua última observação como detentor do MESMO produto (mesma plataforma e
+    `marketplace_product_id`) ANTES daquele turno — `merge_asof` para trás,
+    sem casar o próprio turno. Os dois são preço de vitrine observado; nada
+    aqui é custo ou margem.
+    """
+    # Toda perda continua na saída — sem par comparável ela só fica sem preço.
+    base = perdidos.reset_index(drop=True).assign(meu_preco=np.nan, gap_pct=np.nan)
+    if base.empty or limpo.empty:
+        return base
+    meus = _detidos(limpo).dropna(subset=["marketplace_product_id", "preco"])
+    meus = (meus.assign(_t=_momento(meus))
+            .dropna(subset=["_t"])[["plataforma", "marketplace_product_id", "_t", "preco"]]
+            .rename(columns={"preco": "meu_preco"})
+            .sort_values("_t"))
+    perd = (base[["plataforma", "marketplace_product_id"]]
+            .assign(_t=_momento(base), _i=np.arange(len(base)))
+            .dropna(subset=["_t", "marketplace_product_id"])
+            .sort_values("_t"))
+    if meus.empty or perd.empty:
+        return base
+    casado = pd.merge_asof(perd, meus, on="_t",
+                           by=["plataforma", "marketplace_product_id"],
+                           direction="backward", allow_exact_matches=False)
+    base.loc[casado["_i"].to_numpy(), "meu_preco"] = casado["meu_preco"].to_numpy()
+    base["gap_pct"] = (base["preco"] / base["meu_preco"] - 1) * 100
+    return base
+
+
+def _grafico_rivais(placar: pd.DataFrame) -> go.Figure:
+    """Borboleta: perdas para a esquerda, ganhos para a direita, um eixo só."""
+    tema = _tema()
+    topo = placar.head(10).iloc[::-1]   # Plotly desenha a 1ª categoria embaixo
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=topo.index, x=-topo["perdas"], orientation="h", name="Levou de você",
+        marker_color=Config.Colors.PERDA[tema], customdata=topo["perdas"],
+        hovertemplate="%{y} levou %{customdata} de você<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        y=topo.index, x=topo["ganhos"], orientation="h", name="Você tomou dele",
+        marker_color=Config.Colors.GANHO[tema],
+        hovertemplate="Você tomou %{x} de %{y}<extra></extra>",
+    ))
+    fig.add_vline(x=0, line_width=1, line_color=Config.Colors.OUTRAS)
+    _layout(fig, max(260, 34 * len(topo) + 80), barmode="relative", bargap=0.3,
+            barcornerradius=4, hovermode="closest")
+    fig.update_xaxes(title_text="← perdas · ganhos →")
+    return fig
+
+
+def _grafico_quebra(ganhos: pd.DataFrame, perdidos: pd.DataFrame, dimensao: str) -> go.Figure:
+    """Ganhos e perdas lado a lado por turno, plataforma ou marca."""
+    tema = _tema()
+    if dimensao == "Turno":
+        chave_g, chave_p = ganhos["turno"], perdidos["turno"]
+    elif dimensao == "Plataforma":
+        chave_g, chave_p = ganhos["plataforma"], perdidos["plataforma"]
+    else:
+        chave_g, chave_p = _marca(ganhos), _marca(perdidos)
+    tabela = pd.concat([ganhos.groupby(chave_g).size().rename("Ganhos"),
+                        perdidos.groupby(chave_p).size().rename("Perdas")],
+                       axis=1).fillna(0).astype(int)
+    if dimensao == "Turno":
+        tabela = tabela.loc[sorted(tabela.index, key=lambda t: TURNO_ORDEM.get(str(t).lower(), 9),
+                                   reverse=True)]
+    else:
+        tabela = tabela.assign(_t=tabela.sum(axis=1)).sort_values("_t").drop(columns="_t").tail(12)
+    viradas = tabela["Ganhos"] + tabela["Perdas"]
+    taxa = (100 * tabela["Ganhos"] / viradas.where(viradas > 0)).round(0)
+    fig = go.Figure()
+    # Barra horizontal agrupada desenha o 1º traço EMBAIXO dentro do grupo:
+    # Perdas entra primeiro para Ganhos ficar em cima, e a legenda inverte
+    # para ler na mesma ordem das barras.
+    for coluna, cor in (("Perdas", Config.Colors.PERDA[tema]), ("Ganhos", Config.Colors.GANHO[tema])):
+        fig.add_trace(go.Bar(
+            y=tabela.index, x=tabela[coluna], orientation="h", name=coluna,
+            marker_color=cor, customdata=taxa,
+            hovertemplate=f"{coluna}: %{{x}} · vitória nas viradas %{{customdata:.0f}}%<extra>%{{y}}</extra>",
+        ))
+    _layout(fig, max(220, 44 * len(tabela) + 80), barmode="group", bargap=0.3,
+            bargroupgap=0.08, barcornerradius=4, hovermode="closest")
+    fig.update_layout(legend_traceorder="reversed")
+    return fig
+
+
+def render_aba_ganhos_perdas(limpo: pd.DataFrame, perdidos: pd.DataFrame,
+                             cobertura: pd.DataFrame, desde: date) -> None:
+    ganhos = _ganhos(limpo) if not limpo.empty else limpo
+    n_g, n_p = len(ganhos), len(perdidos)
+
+    col_g, col_p, col_s, col_t = st.columns(4)
+    col_g.metric("Ganhos na janela", n_g)
+    col_p.metric("Perdidos na janela", n_p)
+    col_s.metric("Saldo", f"{n_g - n_p:+d}")
+    col_t.metric("Vitória nas viradas", f"{100 * n_g / (n_g + n_p):.0f}%" if (n_g + n_p) else "—",
+                 help="Ganhos ÷ (ganhos + perdas): de todas as trocas de dono "
+                      "que te envolveram, quantas você venceu.")
+    st.caption(
+        "Ganhei = tomei a BB de outro seller. Perdi = outro seller tomou "
+        "a minha. Os dois só existem como EVENTO — a foto de um turno nunca "
+        "mostra \"perdedor\", só quem está com a BB agora."
+    )
+
+    if ganhos.empty and perdidos.empty:
         st.info("Nenhum evento de ganho ou perda na janela.")
         return
-    
-    # Agrupar por data
-    ganhos_por_dia = (limpo[limpo["virou_no_turno"].fillna(False)]
-                      .groupby("data")
-                      .size()
-                      .reindex(pd.date_range(limpo["data"].min(), limpo["data"].max(), freq='D'), fill_value=0)
-                      if not limpo.empty else pd.Series(dtype=int))
-    
-    perdidos_por_dia = (perdidos.groupby("data")
-                        .size()
-                        .reindex(pd.date_range(perdidos["data"].min() if not perdidos.empty else ganhos_por_dia.index.min(),
-                                               perdidos["data"].max() if not perdidos.empty else ganhos_por_dia.index.max(),
-                                               freq='D'), fill_value=0)
-                        if not perdidos.empty else pd.Series(dtype=int))
-    
-    # Criar DataFrame combinado
-    todas_datas = sorted(set(ganhos_por_dia.index.tolist() + perdidos_por_dia.index.tolist()))
-    saldo_df = pd.DataFrame({
-        "ganhos": [ganhos_por_dia.get(d, 0) for d in todas_datas],
-        "perdidos": [perdidos_por_dia.get(d, 0) for d in todas_datas],
-    }, index=todas_datas)
-    saldo_df["saldo"] = saldo_df["ganhos"] - saldo_df["perdidos"]
-    saldo_df["saldo_acum"] = saldo_df["saldo"].cumsum()
-    
-    # Gráfico de cascata
-    fig = go.Figure()
-    
-    # Barras positivas (ganhos)
-    fig.add_trace(go.Bar(
-        x=saldo_df.index,
-        y=saldo_df["ganhos"],
-        name="Ganhos",
-        marker_color=Config.Colors.SUCCESS,
-        text=saldo_df["ganhos"],
-        textposition="outside",
-    ))
-    
-    # Barras negativas (perdas)
-    fig.add_trace(go.Bar(
-        x=saldo_df.index,
-        y=-saldo_df["perdidos"],
-        name="Perdas",
-        marker_color=Config.Colors.DANGER,
-        text=saldo_df["perdidos"],
-        textposition="outside",
-    ))
-    
-    # Linha de saldo acumulado
-    fig.add_trace(go.Scatter(
-        x=saldo_df.index,
-        y=saldo_df["saldo_acum"],
-        name="Saldo Acumulado",
-        line=dict(color=Config.Colors.PRIMARY, width=3),
-        mode="lines+markers",
-        yaxis="y2",
-    ))
-    
-    fig.update_layout(
-        title="Ganhos e Perdas de Buy Box (Visão de Cascata)",
-        xaxis_title="Data",
-        yaxis_title="Quantidade",
-        barmode="relative",
-        height=400,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        yaxis2=dict(title="Saldo Acumulado", overlaying="y", anchor="x", side="right"),
+
+    # ── Linha do tempo
+    st.markdown("##### Viradas ao longo da janela")
+    freq = st.segmented_control("Agrupar por", ["Dia", "Semana"], default="Dia",
+                                required=True, key="gp_freq")
+    serie = _serie_eventos(ganhos, perdidos, cobertura, desde, freq)
+    st.plotly_chart(_grafico_eventos(serie, freq), width="stretch")
+    sem_coleta = int(serie["ganhos"].isna().sum())
+    st.caption(
+        "Ganhos para cima, perdas para baixo; o painel de baixo acumula o saldo."
+        + (f" {sem_coleta} {'dia' if freq == 'Dia' else 'semana'}(s) sem coleta "
+           "aparecem vazios — não houve leitura, não \"zero virada\"." if sem_coleta else "")
     )
-    
-    st.plotly_chart(fig, use_container_width=True)
+    with st.expander("Ver tabela da série"):
+        st.dataframe(
+            serie.rename_axis("Data").reset_index()
+            .rename(columns={"ganhos": "Ganhos", "perdas": "Perdas",
+                             "saldo": "Saldo", "saldo_acum": "Saldo acumulado"}),
+            column_config={"Data": st.column_config.DateColumn(format="DD/MM/YYYY")},
+            width="stretch", hide_index=True,
+        )
+
+    precos = _preco_na_perda(perdidos, limpo)
+    placar = _rivais(ganhos, perdidos, precos)
+
+    # ── Rivais
+    st.markdown("##### Contra quem você disputa")
+    st.plotly_chart(_grafico_rivais(placar), width="stretch")
+    st.dataframe(
+        placar.reset_index()[["rival", "ganhos", "perdas", "saldo", "gap_mediano"]]
+        .rename(columns={"rival": "Rival", "ganhos": "Você tomou dele",
+                         "perdas": "Ele tomou de você", "saldo": "Saldo",
+                         "gap_mediano": "Preço dele vs o seu (mediana)"})
+        .style
+        .format({"Preço dele vs o seu (mediana)": _pct})
+        .background_gradient(subset=["Saldo"], cmap="RdBu",
+                             vmin=-max(1, placar["saldo"].abs().max()),
+                             vmax=max(1, placar["saldo"].abs().max())),
+        width="stretch", hide_index=True,
+    )
+
+    # ── Preço na perda
+    st.markdown("##### Preço na perda")
+    comparaveis = precos.dropna(subset=["gap_pct"])
+    if comparaveis.empty:
+        st.info("Nenhuma perda com o seu preço anterior observado no mesmo produto dentro da janela.")
+    else:
+        mais_barato = (comparaveis["gap_pct"] < 0).mean() * 100
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Perdas com preço comparável", f"{len(comparaveis)} de {len(precos)}")
+        m2.metric("Rival mais barato", f"{mais_barato:.0f}% das perdas",
+                  help="Em quantas perdas o preço do rival no turno da virada era "
+                       "menor que o seu último preço observado no mesmo produto.")
+        m3.metric("Diferença mediana", _pct(comparaveis["gap_pct"].median()),
+                  help="Preço do rival ÷ seu último preço − 1. Negativo = rival mais barato.")
+        st.caption(
+            "Leitura observada, não causa: além de preço, a BB também é decidida por "
+            "frete, fulfillment e reputação. Os preços são os de vitrine coletados "
+            "(a base de preço pode incluir desconto PIX conforme a plataforma)."
+        )
+
+    # ── Quebra
+    st.markdown("##### Onde e quando as viradas acontecem")
+    dimensao = st.segmented_control("Quebrar por", ["Turno", "Plataforma", "Marca"],
+                                    default="Turno", required=True, key="gp_quebra")
+    st.plotly_chart(_grafico_quebra(ganhos, perdidos, dimensao), width="stretch")
+    st.caption("Passe o mouse para ver a taxa de vitória nas viradas de cada grupo. "
+               "Turno com muita perda costuma ser a hora em que o rival reprecifica.")
+
+    # ── Listas
+    st.markdown("##### ✅ Produtos que você ganhou")
+    if ganhos.empty:
+        st.info("Nenhum ganho de buy box observado na janela.")
+    else:
+        st.dataframe(
+            _com_datas(
+                ganhos.assign(_ord=_momento(ganhos)).sort_values("_ord", ascending=False)[
+                    ["data", "turno", "plataforma", "produto", "marca",
+                     "detentor_anterior", "preco"]]
+                .rename(columns={
+                    "data": "Data", "turno": "Turno", "plataforma": "Plataforma",
+                    "produto": "Produto", "marca": "Marca",
+                    "detentor_anterior": "Tomou de", "preco": "Preço"})
+                .style
+                .format({"Preço": _brl})),
+            width="stretch",
+            hide_index=True
+        )
+
+    st.markdown("##### ❌ Produtos que você perdeu")
+    if perdidos.empty:
+        st.info("Nenhuma perda de buy box observada na janela.")
+    else:
+        st.dataframe(
+            _com_datas(
+                # Comparação de preço antes do título do produto (a coluna
+                # mais larga), para caber na tela sem rolar para o lado.
+                precos.assign(_ord=_momento(precos)).sort_values("_ord", ascending=False)[
+                    ["data", "turno", "plataforma", "seller_canonical", "preco",
+                     "meu_preco", "gap_pct", "produto", "marca"]]
+                .rename(columns={
+                    "data": "Data", "turno": "Turno", "plataforma": "Plataforma",
+                    "produto": "Produto", "marca": "Marca",
+                    "seller_canonical": "Levou", "preco": "Preço dele",
+                    "meu_preco": "Seu último preço", "gap_pct": "Diferença"})
+                .style
+                .format({"Preço dele": _brl, "Seu último preço": _brl, "Diferença": _pct})),
+            width="stretch",
+            hide_index=True
+        )
+    st.caption("Toda tabela exporta para CSV pelo ícone ⬇ que aparece ao passar o mouse sobre ela.")
 
 
+# ── Aba Marcas e posição ─────────────────────────────────────────────────────
+def _por_marca(detidos: pd.DataFrame) -> pd.Series:
+    """Produtos distintos com a BB, por marca."""
+    if detidos.empty:
+        return pd.Series(dtype=int)
+    return (detidos.assign(_produto=_chave_produto(detidos), _marca=_marca(detidos))
+            .groupby("_marca")["_produto"].nunique())
+
+
+def _grafico_barras_marca(por_marca: pd.Series) -> go.Figure:
+    # Plotly respeita a ordem de chegada e desenha a PRIMEIRA categoria
+    # embaixo — por isso a série entra em ordem CRESCENTE: a marca com mais
+    # produtos (última) termina no topo, maior→menor de cima pra baixo.
+    por_marca = por_marca.sort_values(ascending=True)
+    fig = go.Figure(go.Bar(
+        x=por_marca.values,
+        y=por_marca.index,
+        orientation="h",
+        marker_color=Config.Colors.PRIMARY,
+        hovertemplate="<b>%{y}</b><br>Produtos: %{x}<extra></extra>",
+    ))
+    fig.update_layout(
+        height=max(Config.CHART_HEIGHT_MARCA, 28 * len(por_marca)),
+        xaxis_title="Número de Produtos",
+        yaxis_title="Marca",
+        margin=dict(l=150, r=40, t=20, b=40),
+        bargap=0.25,
+        barcornerradius=4,
+    )
+    return fig
+
+
+def _grafico_comparar_marcas(a: pd.Series, b: pd.Series, dia_a, dia_b) -> go.Figure:
+    """Barras agrupadas A (cinza, contexto) × B (cor, foco) por marca."""
+    tabela = pd.concat([a.rename("A"), b.rename("B")], axis=1).fillna(0)
+    tabela = tabela.assign(_t=tabela.max(axis=1)).sort_values("_t").drop(columns="_t")
+    fig = go.Figure()
+    # B entra primeiro para A ficar EM CIMA no grupo (a barra horizontal
+    # empilha o 1º traço embaixo): lê-se A → B de cima para baixo, e a
+    # legenda invertida acompanha.
+    fig.add_trace(go.Bar(y=tabela.index, x=tabela["B"], orientation="h",
+                         name=f"B · {_fmt_dia(dia_b)}",
+                         marker_color=Config.Colors.CATEGORICA[_tema()][0],
+                         hovertemplate="B: %{x:.0f}<extra>%{y}</extra>"))
+    fig.add_trace(go.Bar(y=tabela.index, x=tabela["A"], orientation="h",
+                         name=f"A · {_fmt_dia(dia_a)}", marker_color=Config.Colors.OUTRAS,
+                         hovertemplate="A: %{x:.0f}<extra>%{y}</extra>"))
+    _layout(fig, max(Config.CHART_HEIGHT_MARCA, 40 * len(tabela) + 80), barmode="group",
+            bargap=0.25, bargroupgap=0.08, barcornerradius=4, hovermode="y unified",
+            legend_traceorder="reversed")
+    fig.update_xaxes(title_text="Produtos com a BB")
+    return fig
+
+
+def _evolucao_marcas(detidos: pd.DataFrame, top_n: int = 6) -> pd.DataFrame:
+    """Produtos com a BB por dia × marca; marcas fora do top-N viram "Outras".
+
+    O top-N é pelo total da janela — a legenda fica estável enquanto a janela
+    e o filtro de plataforma não mudam.
+    """
+    base = detidos.assign(_produto=_chave_produto(detidos), _marca=_marca(detidos))
+    ranking = base.groupby("_marca")["_produto"].nunique().sort_values(ascending=False)
+    principais = ranking.index[:top_n]
+    base["_marca"] = base["_marca"].where(base["_marca"].isin(principais), "Outras")
+    pivo = (base.groupby(["data", "_marca"])["_produto"].nunique()
+            .unstack(fill_value=0))
+    ordem = [m for m in principais if m in pivo.columns] + (["Outras"] if "Outras" in pivo.columns else [])
+    return pivo[ordem]
+
+
+def _grafico_evolucao_marcas(pivo: pd.DataFrame, modo: str) -> go.Figure:
+    paleta = Config.Colors.CATEGORICA[_tema()]
+    fig = go.Figure()
+    for i, marca in enumerate(pivo.columns):
+        cor = Config.Colors.OUTRAS if marca == "Outras" else paleta[i % len(paleta)]
+        if modo == "% do portfólio":
+            fig.add_trace(go.Scatter(
+                x=pivo.index, y=pivo[marca], name=marca, mode="lines",
+                stackgroup="um", groupnorm="percent",
+                line=dict(color=cor, width=1), fillcolor=cor,
+                hovertemplate=f"{marca}: %{{y:.1f}}%<extra></extra>",
+            ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=pivo.index, y=pivo[marca], name=marca, mode="lines+markers",
+                line=dict(color=cor, width=2), marker=dict(size=5),
+                hovertemplate=f"{marca}: %{{y:.0f}}<extra></extra>",
+            ))
+    _layout(fig, 360, yaxis_title="% dos seus produtos com BB" if modo == "% do portfólio"
+            else "Produtos com a BB")
+    fig.update_xaxes(tickformat="%d/%m")
+    if modo == "% do portfólio":
+        fig.update_yaxes(range=[0, 100], ticksuffix="%")
+    return fig
+
+
+def _mudancas_portfolio(detidos: pd.DataFrame, dia_a, dia_b) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Produtos que entraram (com BB em B e não em A) e que saíram."""
+    base = detidos.assign(_produto=_chave_produto(detidos), _marca=_marca(detidos))
+    cols = ["plataforma", "_produto"]
+    em_a = base[base["data"] == dia_a].drop_duplicates(cols)
+    em_b = base[base["data"] == dia_b].drop_duplicates(cols)
+    chave_a = set(map(tuple, em_a[cols].to_numpy()))
+    chave_b = set(map(tuple, em_b[cols].to_numpy()))
+    entrou = em_b[[tuple(k) not in chave_a for k in em_b[cols].to_numpy()]]
+    saiu = em_a[[tuple(k) not in chave_b for k in em_a[cols].to_numpy()]]
+    mostrar = {"_marca": "Marca", "produto": "Produto", "plataforma": "Plataforma", "preco": "Preço"}
+    return (entrou[list(mostrar)].rename(columns=mostrar).sort_values(["Marca", "Produto"]),
+            saiu[list(mostrar)].rename(columns=mostrar).sort_values(["Marca", "Produto"]))
+
+
+def render_aba_marcas(limpo: pd.DataFrame) -> None:
+    detidos = _detidos(limpo) if not limpo.empty else limpo
+    st.markdown("##### Portfólio — produtos detidos por marca")
+    marcas_dias: dict[str, pd.Timestamp] = {}
+
+    if detidos.empty:
+        st.info("Sem produto com buy box detida na janela.")
+    else:
+        dias = [pd.Timestamp(d) for d in sorted(detidos["data"].dropna().unique())]
+        modo = st.segmented_control(
+            "Período", ["Janela inteira", "Um dia", "Comparar dois dias"],
+            default="Janela inteira", required=True, key="marcas_modo",
+            help="Janela inteira soma todo produto que teve a sua BB em algum "
+                 "turno da janela. Um dia mostra a foto daquele dia (qualquer "
+                 "turno). Comparar mostra o que mudou entre duas datas.")
+
+        if modo == "Um dia":
+            # Sem `key` de propósito: as opções mudam com a janela, e o id do
+            # widget muda junto — valor antigo fora da lista não sobrevive.
+            dia = st.select_slider("Dia", options=dias, value=dias[-1], format_func=_fmt_dia)
+            marcas_dias = {_fmt_dia(dia): dia}
+            por_marca = _por_marca(detidos[detidos["data"] == dia])
+            st.plotly_chart(_grafico_barras_marca(por_marca), width="stretch")
+            st.caption(f"{int(por_marca.sum())} produtos com a sua BB em {_fmt_dia(dia)}, "
+                       "somando os turnos do dia.")
+
+        elif modo == "Comparar dois dias":
+            if len(dias) < 2:
+                st.info("A janela tem um dia só com BB detida — aumente a janela para comparar.")
+            else:
+                dia_a, dia_b = st.select_slider(
+                    "Comparar A → B", options=dias,
+                    value=(dias[max(0, len(dias) - 8)], dias[-1]), format_func=_fmt_dia)
+                if dia_a == dia_b:
+                    st.info("Escolha duas datas diferentes para comparar.")
+                else:
+                    marcas_dias = {"A": dia_a, "B": dia_b}
+                    a = _por_marca(detidos[detidos["data"] == dia_a])
+                    b = _por_marca(detidos[detidos["data"] == dia_b])
+                    ta, tb = a.sum(), b.sum()
+                    k1, k2, k3 = st.columns(3)
+                    k1.metric(f"Produtos em {_fmt_dia(dia_a)}", int(ta))
+                    k2.metric(f"Produtos em {_fmt_dia(dia_b)}", int(tb), delta=f"{int(tb - ta):+d}")
+                    k3.metric("Marcas com BB", f"{(b > 0).sum()}",
+                              delta=f"{int((b > 0).sum() - (a > 0).sum()):+d}")
+                    st.plotly_chart(_grafico_comparar_marcas(a, b, dia_a, dia_b), width="stretch")
+
+                    comp = pd.concat([a.rename("A"), b.rename("B")], axis=1).fillna(0).astype(int)
+                    comp["Δ"] = comp["B"] - comp["A"]
+                    comp["% portfólio A"] = 100 * comp["A"] / ta if ta else 0.0
+                    comp["% portfólio B"] = 100 * comp["B"] / tb if tb else 0.0
+                    comp["Δ pp"] = comp["% portfólio B"] - comp["% portfólio A"]
+                    comp = comp.reindex(comp["Δ"].abs().sort_values(ascending=False).index)
+                    lim = max(1, int(comp["Δ"].abs().max()))
+                    st.dataframe(
+                        comp.rename_axis("Marca").reset_index()
+                        .rename(columns={"A": _fmt_dia(dia_a), "B": _fmt_dia(dia_b)})
+                        .style
+                        .format({"% portfólio A": "{:.1f}%", "% portfólio B": "{:.1f}%",
+                                 "Δ pp": "{:+.1f}", "Δ": "{:+d}"})
+                        .background_gradient(subset=["Δ"], cmap="RdBu", vmin=-lim, vmax=lim),
+                        width="stretch", hide_index=True,
+                    )
+                    entrou, saiu = _mudancas_portfolio(detidos, dia_a, dia_b)
+                    with st.expander(f"O que mudou: {len(entrou)} produtos entraram, "
+                                     f"{len(saiu)} saíram do seu portfólio com BB"):
+                        c_in, c_out = st.columns(2)
+                        c_in.markdown("**Entraram** (BB em B, não em A)")
+                        c_in.dataframe(entrou.style.format({"Preço": _brl}),
+                                       width="stretch", hide_index=True)
+                        c_out.markdown("**Saíram** (BB em A, não em B)")
+                        c_out.dataframe(saiu.style.format({"Preço": _brl}),
+                                        width="stretch", hide_index=True)
+                    st.caption("Produto que \"saiu\" pode ter sido perdido para um rival "
+                               "**ou** não ter sido coletado no dia B — confira a aba Cobertura.")
+
+        else:
+            por_marca = _por_marca(detidos)
+            st.plotly_chart(_grafico_barras_marca(por_marca), width="stretch")
+
+        # Evolução — responde "o mix de marcas está mudando?" sem precisar
+        # comparar fotos uma a uma.
+        st.markdown("##### Evolução do portfólio por marca")
+        modo_evo = st.segmented_control("Medida", ["Produtos", "% do portfólio"],
+                                        default="Produtos", required=True, key="marcas_evo")
+        pivo = _evolucao_marcas(detidos)
+        fig = _grafico_evolucao_marcas(pivo, modo_evo)
+        _marcar_dias(fig, marcas_dias)
+        st.plotly_chart(fig, width="stretch")
+        with st.expander("Ver tabela da evolução"):
+            st.dataframe(pivo.rename_axis("Data").reset_index(),
+                         column_config={"Data": st.column_config.DateColumn(format="DD/MM/YYYY")},
+                         width="stretch", hide_index=True)
+
+    # Fora do `else` de propósito: com o filtro só em plataformas sem BB
+    # exposta, o portfólio fica vazio e é ESTE aviso que explica o porquê.
+    sem_buybox_exposta = (int(limpo.loc[limpo["detentor_buybox"].isna(), "offer_key"].nunique())
+                          if not limpo.empty else 0)
+    if sem_buybox_exposta:
+        st.caption(
+            f"⚠️ {sem_buybox_exposta} ofertas ficaram fora do portfólio por marca: "
+            "estão em plataformas que não expõem vencedor de buy box na "
+            "vitrine (ex.: Casas Bahia). A Amazon passou a expor via PDP "
+            "(coletor Amazon-only no GitHub Actions, Set/2026), então já "
+            "entra aqui."
+        )
+
+    st.markdown("##### Posição mediana por plataforma")
+    if limpo.empty or limpo["posicao_mediana"].isna().all():
+        st.info("Sem dado de posição na janela.")
+    else:
+        # median(), não mean(): a coluna já é a mediana POR OFERTA
+        # (entre keywords, dentro de um turno); agregar várias ofertas
+        # com mean() vira "média das medianas", que não é o que o
+        # título promete. median() é o mais próximo que dá pra honrar
+        # o rótulo sem ter a posição bruta por keyword nesta camada.
+        pos = (limpo.groupby(["data", "plataforma"])["posicao_mediana"]
+               .median().reset_index()
+               .pivot(index="data", columns="plataforma", values="posicao_mediana"))
+
+        fig = go.Figure()
+        for plataforma in pos.columns:
+            fig.add_trace(go.Scatter(
+                x=pos.index,
+                y=pos[plataforma],
+                name=plataforma,
+                mode="lines+markers",
+                line=dict(color=_cor_plataforma(plataforma), width=2),
+                marker=dict(size=5),
+                hovertemplate=f"{plataforma}: %{{y:.0f}}<extra></extra>",
+            ))
+
+        # Linha de referência Top 3
+        fig.add_hline(
+            y=3,
+            line_dash="dash",
+            annotation_text="Top 3 (Referência)",
+            annotation_position="top right",
+            line_color=Config.Colors.OUTRAS,
+            line_width=1,
+        )
+        _marcar_dias(fig, marcas_dias)
+        _layout(fig, Config.CHART_HEIGHT_POSICAO, yaxis_title="Posição mediana")
+        fig.update_yaxes(autorange="reversed")  # Menor é melhor
+        fig.update_xaxes(tickformat="%d/%m")
+        st.plotly_chart(fig, width="stretch")
+
+        st.caption(
+            "Quanto menor, melhor — é a posição mediana entre as keywords em "
+            "que a oferta apareceu no turno. Não soma entre plataformas nem "
+            "vira ranking absoluto: é relativa a cada busca."
+        )
+
+    if not limpo.empty and limpo["tipo_seller"].notna().any():
+        st.markdown("##### Como você aparece na vitrine")
+        # Ofertas DISTINTAS: contar linhas somaria a mesma oferta uma vez por
+        # turno observado.
+        tipos = limpo.dropna(subset=["tipo_seller"]).groupby("tipo_seller")["offer_key"] \
+                     .nunique().sort_values(ascending=False)
+        st.dataframe(
+            tipos.rename_axis("Tipo de seller").reset_index(name="Ofertas")
+            .style
+            .background_gradient(subset=["Ofertas"], cmap="Blues"),
+            width="stretch",
+            hide_index=True
+        )
+
+
+# ── Aba Ranking ──────────────────────────────────────────────────────────────
+def render_aba_ranking(mercado: pd.DataFrame, share: pd.DataFrame, seller: str) -> None:
+    plataformas_do_seller = sorted(share["plataforma"].unique()) if not share.empty else []
+    if not plataformas_do_seller or mercado.empty:
+        st.info("Sem ranking disponível — este seller não detém buy box em nenhuma plataforma na janela.")
+        return
+
+    mercado = mercado[mercado["plataforma"].isin(plataformas_do_seller)].copy()
+    grupo = mercado.groupby(["data", "plataforma"])["share_buybox_pct"]
+    mercado["posicao"] = grupo.rank(ascending=False, method="min")
+    mercado["lider"] = grupo.transform("max")
+    mercado["sellers"] = grupo.transform("size")
+
+    # Série: a mesma régua da fotografia abaixo, aplicada a cada dia.
+    meu = mercado[mercado["seller_canonical"] == seller].copy()
+    if not meu.empty:
+        st.markdown("##### Sua posição no ranking, dia a dia")
+        pivo = meu.pivot_table(index="data", columns="plataforma", values="posicao", aggfunc="min")
+        fig = go.Figure()
+        for plataforma in pivo.columns:
+            fig.add_trace(go.Scatter(
+                x=pivo.index, y=pivo[plataforma], name=plataforma, mode="lines+markers",
+                line=dict(color=_cor_plataforma(plataforma), width=2), marker=dict(size=5),
+                hovertemplate=f"{plataforma}: #%{{y:.0f}}<extra></extra>",
+            ))
+        _layout(fig, 300, yaxis_title="Posição (#)")
+        # Posição é inteira: marca de 1 em 1 enquanto couber; em ranking longo
+        # o Plotly escolhe o passo (sempre inteiro, pelo `tickformat`).
+        fig.update_yaxes(autorange="reversed", tickformat="d",
+                         dtick=1 if pivo.max().max() <= 12 else None)
+        fig.update_xaxes(tickformat="%d/%m")
+        st.plotly_chart(fig, width="stretch")
+        with st.expander("Ver tabela — posição e distância para o líder"):
+            st.dataframe(
+                meu.assign(gap=meu["share_buybox_pct"] - meu["lider"])
+                .sort_values(["data", "plataforma"], ascending=[False, True])
+                [["data", "plataforma", "posicao", "sellers", "share_buybox_pct", "lider", "gap"]]
+                .rename(columns={"data": "Data", "plataforma": "Plataforma", "posicao": "#",
+                                 "sellers": "Sellers", "share_buybox_pct": "Seu share %",
+                                 "lider": "Share do líder %", "gap": "Distância (pp)"}),
+                column_config={
+                    "Data": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                    "#": st.column_config.NumberColumn(format="%d"),
+                    "Seu share %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Share do líder %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Distância (pp)": st.column_config.NumberColumn(format="%+.1f"),
+                },
+                width="stretch", hide_index=True,
+            )
+        st.caption("Dia sem ponto = você não deteve nenhum produto naquela plataforma "
+                   "(a view não tem linha de seller ausente) ou a coleta não rodou.")
+
+    # Cada plataforma no seu próprio último dia observado (ver KPI): a
+    # Amazon materializa com atraso e o max() global de `data` a apagava
+    # deste ranking. Assim ela aparece mesmo um dia defasada.
+    st.markdown("##### Fotografia do último dia observado")
+    ultimo_por_plat = mercado.groupby("plataforma")["data"].transform("max")
+    foto = mercado[mercado["data"] == ultimo_por_plat].copy()
+    foto["posicao"] = foto["posicao"].astype(int)
+    for plataforma in plataformas_do_seller:
+        bloco = foto[foto["plataforma"] == plataforma].sort_values("posicao")
+        total = len(bloco)
+        linha_seller = bloco[bloco["seller_canonical"] == seller]
+        if linha_seller.empty:
+            continue
+        minha_posicao = int(linha_seller["posicao"].iloc[0])
+        dia_plat = bloco["data"].iloc[0]
+        st.markdown(
+            f"**{plataforma}** — você é **#{minha_posicao} de {total}** "
+            f"· observado em {_fmt_dia(dia_plat)}"
+        )
+        topo = bloco.head(Config.TOP_RANKING_DISPLAY).copy()
+        if minha_posicao > Config.TOP_RANKING_DISPLAY:
+            topo = pd.concat([topo, linha_seller])
+        topo["Você"] = topo["seller_canonical"].eq(seller).map({True: "✅", False: ""})
+        st.dataframe(
+            topo[["posicao", "seller_canonical", "Você", "produtos_detidos",
+                  "produtos_universo", "share_buybox_pct"]]
+            .rename(columns={
+                "posicao": "#", "seller_canonical": "Seller",
+                "produtos_detidos": "Com a BB",
+                "produtos_universo": "Universo", "share_buybox_pct": "Share %"
+            })
+            .style
+            .background_gradient(subset=["Share %"], cmap="Greens")
+            .format({"Share %": "{:.1f}%"})
+            .highlight_min(subset=["#"], color=Config.Colors.SUCCESS + "33"),
+            width="stretch",
+            hide_index=True
+        )
+
+
+# ── Aba Cobertura ────────────────────────────────────────────────────────────
 def render_calendar_heatmap(cobertura: pd.DataFrame) -> None:
     """Renderiza calendar heatmap para cobertura."""
     if cobertura.empty:
         st.warning("Sem registro de cobertura no período.")
         return
-    
-    resumo = (cobertura.assign(observado=cobertura["observado"].astype(bool))
+
+    resumo = (cobertura.assign(observado=_sim(cobertura["observado"]))
               .groupby(["data", "plataforma"])
               .agg(turnos_observados=("observado", "sum"),
                    linhas=("linhas", "sum"))
               .reset_index())
-    
+
     # Pivot para heatmap
     cobertura_pivot = resumo.pivot(
         index="plataforma", columns="data", values="turnos_observados"
     ).fillna(0)
-    
+
     # Normalizar para porcentagem (0-3 turnos → 0-100%)
     cobertura_pct = (cobertura_pivot / 3 * 100).round(1)
-    
+
     fig = go.Figure(data=go.Heatmap(
         z=cobertura_pct.values,
         x=[pd.Timestamp(x).strftime("%d/%m") for x in cobertura_pct.columns],
@@ -873,7 +1690,7 @@ def render_calendar_heatmap(cobertura: pd.DataFrame) -> None:
             "<extra></extra>"
         ),
     ))
-    
+
     fig.update_layout(
         title="Cobertura de Coleta por Plataforma e Data (Heatmap)",
         xaxis_title="Data",
@@ -881,18 +1698,22 @@ def render_calendar_heatmap(cobertura: pd.DataFrame) -> None:
         height=max(200, len(cobertura_pct.index) * 50),
         margin=dict(l=100, r=40, t=60, b=60),
     )
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
+
+    st.plotly_chart(fig, width="stretch")
+
     # Tabela de faltantes
     faltantes = resumo[resumo["turnos_observados"] < 3]
     if not faltantes.empty:
         st.warning(f"{len(faltantes)} combinações data×plataforma com menos de 3 turnos.")
         st.dataframe(
-            faltantes.style
-            .background_gradient(subset=["turnos_observados"], cmap="RdYlGn", vmin=0, vmax=3)
-            .format({"turnos_observados": "{:.0f}", "linhas": "{:,.0f}"}),
-            use_container_width=True,
+            _com_datas(
+                faltantes.rename(columns={"data": "Data", "plataforma": "Plataforma",
+                                          "turnos_observados": "Turnos observados",
+                                          "linhas": "Linhas"})
+                .style
+                .background_gradient(subset=["Turnos observados"], cmap="RdYlGn", vmin=0, vmax=3)
+                .format({"Turnos observados": "{:.0f}", "Linhas": "{:,.0f}"})),
+            width="stretch",
             hide_index=True
         )
     else:
@@ -922,7 +1743,12 @@ def _escolher_seller(desde: date) -> tuple[str | None, pd.DataFrame]:
     Retorna também o mercado (todos os sellers) já carregado, para não buscar
     duas vezes — o ranking da aba própria reusa o mesmo dataframe.
     """
-    mercado = carregar_mercado(desde)
+    try:
+        mercado = carregar_mercado(desde)
+    except Exception as e:
+        logger.error(f"Erro ao carregar mercado: {e}")
+        st.sidebar.error(f"Falha ao carregar o mercado: {e}")
+        mercado = _tipar(_quadro([], _COLUNAS_SHARE))
     travado = st.secrets.get("SELLER")
 
     if travado:
@@ -968,27 +1794,21 @@ def main() -> None:
     )
 
     # Carregar dados
-    fato, share, cobertura = carregar(seller, desde)
-    perdidos = carregar_perdidos(seller, desde)
+    try:
+        fato, share, cobertura = carregar(seller, desde)
+    except Exception as e:
+        st.error(f"Não foi possível carregar os dados de **{seller}** agora ({e}). "
+                 "Tente de novo em instantes.")
+        return
+    try:
+        perdidos = carregar_perdidos(seller, desde)
+    except Exception as e:
+        logger.error(f"Erro ao carregar perdidos de {seller}: {e}")
+        st.warning("As **perdas** de buy box não puderam ser carregadas agora — "
+                   "perdidos, saldo e rivais abaixo estão incompletos.")
+        perdidos = _tipar(_quadro([], _SELECT_PERDIDOS))
 
     vazio = fato.empty
-    
-    # Detectar e exibir anomalias
-    if not vazio:
-        limpo_temp = (fato[(fato["superficie"] == "marketplace") & (~fato["identidade_suspeita"])]
-                     if not vazio else fato)
-        ganhos_temp = limpo_temp[limpo_temp["virou_no_turno"].fillna(False)]
-        alertas = detectar_anomalias(fato, ganhos_temp, perdidos)
-        
-        if alertas:
-            st.markdown("### ⚠️ Alertas Detectados")
-            for alerta in alertas:
-                if "🔴" in alerta:
-                    st.error(alerta)
-                elif "📉" in alerta:
-                    st.warning(alerta)
-                else:
-                    st.info(alerta)
 
     if vazio:
         # Sem KPI, mas as abas CONTINUAM: a de Cobertura é justamente o que
@@ -1039,11 +1859,32 @@ def main() -> None:
 
     # ── Só marketplace entra em KPI. Loja própria o lojista joga sozinho, e
     #    identidade suspeita é chave colapsada: nem numerador, nem denominador.
-    limpo = (fato[(fato["superficie"] == "marketplace") & (~fato["identidade_suspeita"])]
-             if not vazio else fato)
+    limpo = fato[(fato["superficie"] == "marketplace").to_numpy(dtype=bool)
+                 & ~_sim(fato["identidade_suspeita"])]
+
+    # ── Filtro de plataforma: UM filtro, na sidebar, que vale para todas as
+    #    abas e para os KPIs — filtro dentro de cada gráfico deixaria cada aba
+    #    contando uma história de um recorte diferente.
+    plataformas = sorted(set(limpo["plataforma"].dropna()) | set(share["plataforma"].dropna())
+                         | set(perdidos["plataforma"].dropna()))
+    escolha = st.sidebar.multiselect(
+        "Plataformas", plataformas, placeholder="Todas",
+        help="Recorta KPIs, gráficos e tabelas de todas as abas. Vazio = todas.")
+    if escolha:
+        limpo = limpo[limpo["plataforma"].isin(escolha)]
+        share = share[share["plataforma"].isin(escolha)]
+        perdidos = perdidos[perdidos["plataforma"].isin(escolha)]
+        cobertura = cobertura[cobertura["plataforma"].isin(escolha)]
+        mercado = mercado[mercado["plataforma"].isin(escolha)]
 
     if not vazio:
         render_kpi_cards(share, limpo, perdidos)
+
+        alertas = detectar_anomalias(share, limpo, _ganhos(limpo), perdidos)
+        if alertas:
+            with st.expander(f"⚠️ {len(alertas)} alerta(s) na janela", expanded=True):
+                for nivel, texto in alertas:
+                    {"erro": st.error, "aviso": st.warning}.get(nivel, st.info)(texto)
 
     aba1, aba2, aba3, aba4, aba5 = st.tabs([
         "📈 Share de buy box", "🏆 Ganhos e perdas", "🏷️ Marcas e posição",
@@ -1051,227 +1892,16 @@ def main() -> None:
     ])
 
     with aba1:
-        render_gráfico_share(share)
+        render_aba_share(share)
 
     with aba2:
-        col_g, col_p = st.columns(2)
-        ganhos_count = len(limpo[limpo["virou_no_turno"].fillna(False)]) if not limpo.empty else 0
-        perdidos_count = len(perdidos)
-        col_g.metric("Ganhos na janela", ganhos_count)
-        col_p.metric("Perdidos na janela", perdidos_count)
-        st.caption(
-            "Ganhei = tomei a BB de outro seller. Perdi = outro seller tomou "
-            "a minha. Os dois só existem como EVENTO — a foto de um turno nunca "
-            "mostra \\\"perdedor\\\", só quem está com a BB agora."
-        )
-
-        # Gráfico de cascata
-        render_ganhos_perdas_cascata(limpo, perdidos)
-
-        st.markdown("##### ✅ Produtos que você ganhou")
-        ganhos = limpo[limpo["virou_no_turno"].fillna(False)] if not limpo.empty else pd.DataFrame()
-        if ganhos.empty:
-            st.info("Nenhum ganho de buy box observado na janela.")
-        else:
-            st.dataframe(
-                ganhos[["data", "turno", "plataforma", "produto", "marca",
-                        "detentor_anterior", "preco"]]
-                .sort_values("data", ascending=False)
-                .rename(columns={
-                    "data": "Data", "turno": "Turno", "plataforma": "Plataforma",
-                    "produto": "Produto", "marca": "Marca",
-                    "detentor_anterior": "Tomou de", "preco": "Preço (R$)"})
-                .style
-                .format({"Preço (R$)": "R$ {:,.2f}"})
-                .background_gradient(subset=["Preço (R$)"], cmap="Blues"),
-                use_container_width=True,
-                hide_index=True
-            )
-
-        st.markdown("##### ❌ Produtos que você perdeu")
-        if perdidos.empty:
-            st.info("Nenhuma perda de buy box observada na janela.")
-        else:
-            st.dataframe(
-                perdidos[["data", "turno", "plataforma", "produto", "marca",
-                          "seller_canonical", "preco"]]
-                .sort_values("data", ascending=False)
-                .rename(columns={
-                    "data": "Data", "turno": "Turno", "plataforma": "Plataforma",
-                    "produto": "Produto", "marca": "Marca",
-                    "seller_canonical": "Levou", "preco": "Preço (R$)"})
-                .style
-                .format({"Preço (R$)": "R$ {:,.2f}"})
-                .background_gradient(subset=["Preço (R$)"], cmap="Reds"),
-                use_container_width=True,
-                hide_index=True
-            )
+        render_aba_ganhos_perdas(limpo, perdidos, cobertura, desde)
 
     with aba3:
-        # `== True` sobre coluna boolean nullable pode virar NA em vez de
-        # False (mesma classe de bug do `virou_no_turno`, já visto travar
-        # a comparação direta) — `.fillna(False).astype(bool)` blinda o
-        # filtro contra isso antes de indexar o DataFrame.
-        mask_bb = ((limpo["detentor_buybox"] == True)  # noqa: E712
-                   .fillna(False).astype(bool).to_numpy()) if not limpo.empty else []
-        detidos_marca = limpo[mask_bb] if not limpo.empty else pd.DataFrame()
-        st.markdown("##### Portfólio — produtos detidos por marca")
-        if detidos_marca.empty:
-            st.info("Sem produto com buy box detida na janela.")
-        else:
-            # Conta PRODUTO (marketplace_product_id), não oferta: a mesma
-            # ligação produto+marca pode render mais de uma offer_key ao
-            # longo da janela (a URL canônica muda, ou o produto cai no
-            # degrau de hash em vez do de id) — contar offer_key infla a
-            # marca. Fallback pro offer_key só nas linhas sem id de produto.
-            chave_produto = detidos_marca["marketplace_product_id"].fillna(
-                detidos_marca["offer_key"])
-            # `marca` NaN cairia fora do groupby por padrão (dropna=True) e
-            # a marca desapareceria do gráfico sem aviso nenhum — rotular
-            # antes de agrupar mantém o produto visível em vez de sumir.
-            marca = detidos_marca["marca"].fillna("Sem marca informada")
-            por_marca = (detidos_marca.assign(_produto=chave_produto, _marca=marca)
-                         .groupby("_marca")["_produto"]
-                         .nunique().sort_values(ascending=True))
-
-            # Gráfico de barras horizontal com Plotly: ao contrário do
-            # Vega-Lite (usado por `st.bar_chart`, que ordena nominal A→Z
-            # por padrão), o Plotly respeita a ordem de chegada dos dados e
-            # desenha a PRIMEIRA categoria embaixo e a ÚLTIMA em cima — por
-            # isso a série entra em ordem CRESCENTE aqui: a marca com mais
-            # produtos (última) termina no topo, maior→menor de cima pra
-            # baixo, como pedido.
-            fig = go.Figure(go.Bar(
-                x=por_marca.values,
-                y=por_marca.index,
-                orientation="h",
-                marker_color=Config.Colors.PRIMARY,
-                hovertemplate="<b>%{y}</b><br>Produtos: %{x}<extra></extra>",
-            ))
-            fig.update_layout(
-                height=max(Config.CHART_HEIGHT_MARCA, 28 * len(por_marca)),
-                xaxis_title="Número de Produtos",
-                yaxis_title="Marca",
-                margin=dict(l=150, r=40, t=40, b=40),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            sem_buybox_exposta = int(limpo["detentor_buybox"].isna().sum()) if not limpo.empty else 0
-            if sem_buybox_exposta:
-                st.caption(
-                    f"⚠️ {sem_buybox_exposta} ofertas ficaram fora deste gráfico: "
-                    "estão em plataformas que não expõem vencedor de buy box na "
-                    "vitrine (ex.: Casas Bahia). A Amazon passou a expor via PDP "
-                    "(coletor Amazon-only no GitHub Actions, Set/2026), então já "
-                    "entra aqui."
-                )
-
-        st.markdown("##### Posição mediana por plataforma")
-        if limpo.empty or limpo["posicao_mediana"].isna().all():
-            st.info("Sem dado de posição na janela.")
-        else:
-            # median(), não mean(): a coluna já é a mediana POR OFERTA
-            # (entre keywords, dentro de um turno); agregar várias ofertas
-            # com mean() vira "média das medianas", que não é o que o
-            # título promete. median() é o mais próximo que dá pra honrar
-            # o rótulo sem ter a posição bruta por keyword nesta camada.
-            pos = (limpo.groupby(["data", "plataforma"])["posicao_mediana"]
-                  .median().reset_index()
-                  .pivot(index="data", columns="plataforma", values="posicao_mediana"))
-            
-            # Gráfico com linha de referência Top 3
-            fig = make_subplots()
-            colors = Config.Colors.palette()
-            for plataforma in pos.columns:
-                fig.add_trace(go.Scatter(
-                    x=pos.index,
-                    y=pos[plataforma],
-                    name=plataforma,
-                    line=dict(color=colors["primary"] if plataforma == "Amazon" else None, width=2),
-                    hovertemplate=f"<b>{plataforma}</b><br>Posição: %{{y:.0f}}<extra></extra>",
-                ))
-            
-            # Linha de referência Top 3
-            fig.add_hline(
-                y=3,
-                line_dash="dash",
-                annotation_text="Top 3 (Referência)",
-                annotation_position="top right",
-                line_color=colors["warning"],
-                line_width=2,
-            )
-            
-            fig.update_layout(
-                height=Config.CHART_HEIGHT_POSICAO,
-                xaxis_title="Data",
-                yaxis_title="Posição Mediana",
-                yaxis=dict(autorange="reversed"),  # Menor é melhor
-                hovermode="x unified",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            st.caption(
-                "Quanto menor, melhor — é a posição mediana entre as keywords em "
-                "que a oferta apareceu no turno. Não soma entre plataformas nem "
-                "vira ranking absoluto: é relativa a cada busca."
-            )
-
-        if not limpo.empty and limpo["tipo_seller"].notna().any():
-            st.markdown("##### Como você aparece na vitrine")
-            tipos = limpo["tipo_seller"].value_counts()
-            st.dataframe(
-                tipos.rename_axis("Tipo de seller").reset_index(name="Ofertas")
-                .style
-                .background_gradient(subset=["Ofertas"], cmap="Blues"),
-                use_container_width=True,
-                hide_index=True
-            )
+        render_aba_marcas(limpo)
 
     with aba4:
-        plataformas_do_seller = sorted(share["plataforma"].unique()) if not share.empty else []
-        if not plataformas_do_seller or mercado.empty:
-            st.info("Sem ranking disponível — este seller não detém buy box em nenhuma plataforma na janela.")
-        else:
-            # Cada plataforma no seu próprio último dia observado (ver KPI): a
-            # Amazon materializa com atraso e o max() global de `data` a apagava
-            # deste ranking. Assim ela aparece mesmo um dia defasada.
-            ultimo_por_plat = mercado.groupby("plataforma")["data"].transform("max")
-            foto = mercado[mercado["data"] == ultimo_por_plat].copy()
-            st.caption("Fotografia do último dia observado de cada plataforma.")
-            foto["posicao"] = foto.groupby("plataforma")["share_buybox_pct"] \
-                                   .rank(ascending=False, method="min").astype(int)
-            for plataforma in plataformas_do_seller:
-                bloco = foto[foto["plataforma"] == plataforma].sort_values("posicao")
-                total = len(bloco)
-                linha_seller = bloco[bloco["seller_canonical"] == seller]
-                if linha_seller.empty:
-                    continue
-                minha_posicao = int(linha_seller["posicao"].iloc[0])
-                dia_plat = bloco["data"].iloc[0]
-                st.markdown(
-                    f"##### {plataforma} — você é **#{minha_posicao} de {total}** "
-                    f"· observado em {dia_plat}"
-                )
-                topo = bloco.head(Config.TOP_RANKING_DISPLAY).copy()
-                if minha_posicao > Config.TOP_RANKING_DISPLAY:
-                    topo = pd.concat([topo, linha_seller])
-                topo["Você"] = topo["seller_canonical"].eq(seller).map({True: "✅", False: ""})
-                st.dataframe(
-                    topo[["posicao", "seller_canonical", "Você", "produtos_detidos",
-                          "produtos_universo", "share_buybox_pct"]]
-                    .rename(columns={
-                        "posicao": "#", "seller_canonical": "Seller",
-                        "produtos_detidos": "Com a BB",
-                        "produtos_universo": "Universo", "share_buybox_pct": "Share %"
-                    })
-                    .style
-                    .background_gradient(subset=["Share %"], cmap="Greens")
-                    .format({"Share %": "{:.1f}%"})
-                    .highlight_min(subset=["#"], color=Config.Colors.SUCCESS + "33"),
-                    use_container_width=True,
-                    hide_index=True
-                )
+        render_aba_ranking(mercado, share, seller)
 
     with aba5:
         st.markdown(
@@ -1279,11 +1909,11 @@ def main() -> None:
             "aqui como não observado, e as células dele ficam fora de todo "
             "número acima — nunca viram zero."
         )
-        
+
         # Calendar heatmap
         render_calendar_heatmap(cobertura)
 
-    suspeitas = int(fato["identidade_suspeita"].sum()) if not vazio else 0
+    suspeitas = int(_sim(fato["identidade_suspeita"]).sum()) if not vazio else 0
     if suspeitas:
         st.divider()
         st.caption(
