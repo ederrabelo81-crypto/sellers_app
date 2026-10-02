@@ -118,7 +118,7 @@ class Config:
     # Paginação e cache
     PAGINA_SIZE: int = 1000
     CACHE_TTL: int = 900  # 15 minutos
-    
+
     # Janela temporal
     WINDOW_MIN: int = 3
     WINDOW_MAX: int = 60
@@ -588,21 +588,46 @@ def _quadro(linhas: list[OfferRow], select: str) -> pd.DataFrame:
     return pd.DataFrame(linhas, columns=select.split(","))
 
 
-def _todas_as_linhas(consulta, ordenar_por: list[str]) -> list[dict]:
+def _todas_as_linhas(fabrica, ordenar_por: list[str]) -> list[dict]:
     """Lê a consulta inteira, página a página.
 
-    O PostgREST devolve no máximo 1.000 linhas e **não avisa** que truncou:
-    um seller com 2.865 linhas na janela apareceria com um terço do histórico,
-    subestimando ofertas, viradas e cobertura sem nenhum sinal na tela. A
-    ordenação estável é o que garante que as páginas não se sobreponham nem
-    pulem linhas entre chamadas.
+    `fabrica` é um callable que devolve uma consulta NOVA a cada chamada, não
+    a consulta já montada — e isso conserta um bug concreto. O builder do
+    supabase-py ACUMULA `offset`/`limit` quando a mesma consulta é paginada
+    reusando o objeto: `.range()` faz `params.add(...)`, que anexa em vez de
+    substituir. No log de produção via-se a URL crescer a cada página
+    (`?...&offset=0&offset=1000&offset=2000...&limit=1000&limit=1000...`), e a
+    resposta só saía certa porque o PostgREST, diante de parâmetros repetidos,
+    usa o ÚLTIMO. É uma dependência frágil de comportamento não documentado: se
+    um dia passar a usar o PRIMEIRO, a paginação relê a primeira página para
+    sempre (loop infinito, URL inchando até estourar). Montar uma consulta
+    limpa por página elimina a dependência — cada requisição leva um só
+    `offset` e um só `limit`.
+
+    O teto de 1.000 linhas por resposta que obriga a paginar é regra do
+    PostgREST (Supabase): ele trunca em 1.000 e **não avisa** — um seller com
+    2.865 linhas na janela apareceria com um terço do histórico, subestimando
+    ofertas, viradas e cobertura sem sinal na tela. A ordenação estável é o que
+    garante que as páginas não se sobreponham nem pulem linhas entre chamadas.
+
+    O backend Postgres direto (adaptador Aiven) não tem esse teto — uma só
+    `SELECT` traz tudo —, então ali a paginação é dispensável e basta uma
+    consulta.
     """
-    for coluna in ordenar_por:
-        consulta = consulta.order(coluna)
+    def _ordenada():
+        consulta = fabrica()
+        for coluna in ordenar_por:
+            consulta = consulta.order(coluna)
+        return consulta
+
+    # Postgres direto: sem teto de linhas por resposta, uma consulta basta.
+    if isinstance(_ordenada(), _PostgresQuery):
+        return _ordenada().execute().data or []
+
     linhas: list[dict] = []
     inicio = 0
     while True:
-        lote = consulta.range(inicio, inicio + PAGINA - 1).execute().data or []
+        lote = _ordenada().range(inicio, inicio + PAGINA - 1).execute().data or []
         linhas.extend(lote)
         if len(lote) < PAGINA:
             return linhas
@@ -620,7 +645,7 @@ def carregar_mercado(desde: date) -> pd.DataFrame:
     """
     cli = _client()
     linhas = _todas_as_linhas(
-        cli.table("v_seller_buybox_share").select("*").gte("data", desde.isoformat()),
+        lambda: cli.table("v_seller_buybox_share").select("*").gte("data", desde.isoformat()),
         # `seller_canonical` como 3º critério não é enfeite: é o que torna a
         # ordenação ÚNICA. `(data, plataforma)` se repete em toda linha do
         # mesmo dia/plataforma — sem desempate, paginação por OFFSET/LIMIT
@@ -643,17 +668,17 @@ def carregar(seller: str, desde: date) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
 
     try:
         fato = _tipar(_quadro(_todas_as_linhas(
-            cli.table("seller_offer_daily").select(_SELECT_FATO)
+            lambda: cli.table("seller_offer_daily").select(_SELECT_FATO)
             .eq("seller_canonical", seller).gte("data", d),
             ["data", "turno", "plataforma", "offer_key"]), _SELECT_FATO))
 
         share = _tipar(_quadro(_todas_as_linhas(
-            cli.table("v_seller_buybox_share").select("*")
+            lambda: cli.table("v_seller_buybox_share").select("*")
             .eq("seller_canonical", seller).gte("data", d),
             ["data", "plataforma"]), _COLUNAS_SHARE))
 
         cobertura = _tipar(_quadro(_todas_as_linhas(
-            cli.table("seller_coverage_daily").select("*").gte("data", d),
+            lambda: cli.table("seller_coverage_daily").select("*").gte("data", d),
             ["data", "turno", "plataforma"]), _COLUNAS_COBERTURA))
 
         return fato, share, cobertura
@@ -675,7 +700,7 @@ def carregar_perdidos(seller: str, desde: date) -> pd.DataFrame:
     """
     cli = _client()
     linhas = _todas_as_linhas(
-        cli.table("seller_offer_daily").select(_SELECT_PERDIDOS)
+        lambda: cli.table("seller_offer_daily").select(_SELECT_PERDIDOS)
         .eq("detentor_anterior", seller).eq("virou_no_turno", True)
         .eq("identidade_suspeita", False).gte("data", desde.isoformat()),
         # A chave primária inteira, para a ordem ser ÚNICA: várias perdas no
