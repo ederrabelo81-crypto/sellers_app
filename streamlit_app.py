@@ -634,6 +634,34 @@ def _todas_as_linhas(fabrica, ordenar_por: list[str]) -> list[dict]:
         inicio += PAGINA
 
 
+def _share_por_dia(cli, desde: date, seller: str | None = None) -> list[dict]:
+    """Lê `v_seller_buybox_share` UM DIA POR VEZ (`data = X`), nunca `data >= X`.
+
+    A view junta dois agregados sobre `seller_offer_daily` (`detidos` e
+    `universo`) por `(data, plataforma)`. Com igualdade o Postgres propaga o
+    filtro para os DOIS lados do join e cada dia sai por índice em ~20 ms. Com
+    `>=` ele não propaga: o lado `universo` agrega o histórico INTEIRO a cada
+    requisição — e a cada página do OFFSET de novo. Em Out/2026, com ~80 mil
+    linhas em 14 dias, isso estourou o `statement_timeout` do papel `anon`
+    (erro 57014) no Supabase: o seletor de sellers voltava vazio e o painel
+    não abria ("Sem sellers com dado na janela selecionada").
+
+    Um dia tem ~200 linhas no mercado todo, abaixo do teto de 1.000 do
+    PostgREST, mas a leitura continua paginada por `_todas_as_linhas` caso o
+    mercado cresça. `(plataforma, seller_canonical)` é a chave de agrupamento
+    da view dentro do dia — ordem única, páginas estáveis.
+    """
+    linhas: list[dict] = []
+    dia = desde
+    while dia <= date.today():
+        def _consulta(d=dia.isoformat()):
+            consulta = cli.table("v_seller_buybox_share").select("*").eq("data", d)
+            return consulta.eq("seller_canonical", seller) if seller else consulta
+        linhas.extend(_todas_as_linhas(_consulta, ["plataforma", "seller_canonical"]))
+        dia += timedelta(days=1)
+    return linhas
+
+
 @st.cache_data(ttl=Config.CACHE_TTL, show_spinner="Carregando dados do mercado...")
 def carregar_mercado(desde: date) -> pd.DataFrame:
     """Share de TODOS os sellers na janela, sem filtro por seller.
@@ -643,17 +671,7 @@ def carregar_mercado(desde: date) -> pd.DataFrame:
     qualquer visitante do marketplace vê — então nomear e ordenar concorrentes
     aqui não fura fronteira nenhuma de tenant.
     """
-    cli = _client()
-    linhas = _todas_as_linhas(
-        lambda: cli.table("v_seller_buybox_share").select("*").gte("data", desde.isoformat()),
-        # `seller_canonical` como 3º critério não é enfeite: é o que torna a
-        # ordenação ÚNICA. `(data, plataforma)` se repete em toda linha do
-        # mesmo dia/plataforma — sem desempate, paginação por OFFSET/LIMIT
-        # não garante ordem estável entre chamadas sucessivas, e linha pode
-        # sumir ou duplicar na fronteira de página (aqui, 1204 > PAGINA=1000,
-        # cruza página de verdade). `(data, plataforma, seller_canonical)` é
-        # a chave de agrupamento da própria view — de fato única.
-        ["data", "plataforma", "seller_canonical"])
+    linhas = _share_por_dia(_client(), desde)
     # Sem try/except aqui de propósito: exceção NÃO entra no cache do
     # `st.cache_data`, dataframe vazio entra — e ficaria 15 min dizendo
     # "sem sellers na janela" depois de uma falha de rede de um segundo.
@@ -672,10 +690,7 @@ def carregar(seller: str, desde: date) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
             .eq("seller_canonical", seller).gte("data", d),
             ["data", "turno", "plataforma", "offer_key"]), _SELECT_FATO))
 
-        share = _tipar(_quadro(_todas_as_linhas(
-            lambda: cli.table("v_seller_buybox_share").select("*")
-            .eq("seller_canonical", seller).gte("data", d),
-            ["data", "plataforma"]), _COLUNAS_SHARE))
+        share = _tipar(_quadro(_share_por_dia(cli, desde, seller), _COLUNAS_SHARE))
 
         cobertura = _tipar(_quadro(_todas_as_linhas(
             lambda: cli.table("seller_coverage_daily").select("*").gte("data", d),
