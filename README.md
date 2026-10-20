@@ -85,6 +85,29 @@ TOML
 uv run streamlit run streamlit_app.py
 ```
 
+## Resumo diário para WhatsApp (`scripts/resumo_diario.py`)
+
+Exceção à regra "só deploy": este script ainda não tem casa no
+RAC-Position-tracker e nasce aqui para os pilotos pagos. Ele não toca no
+painel e o Streamlit Cloud o ignora. Lê as mesmas três fontes, com a mesma
+credencial só-leitura (`RAC_DB_DSN`, do ambiente ou de
+`.streamlit/secrets.toml`), e devolve um texto com a marcação do WhatsApp:
+share de buy box com variação por plataforma, ganhos × perdas nas últimas 24h,
+o rival que mais tirou buy box do seller e até três ações (perda a retomar com
+preço-alvo, queda na busca, produto em que o seller está sozinho).
+
+```bash
+python scripts/resumo_diario.py --demo                       # dados sintéticos, sem banco
+python scripts/resumo_diario.py --seller "Web Continental"   # imprime na tela
+python scripts/resumo_diario.py --seller "A" --seller "B" --saida resumos/   # um .txt por seller
+```
+
+Rodado logo depois do turno das 08h, o resumo cobre a noite e o dia
+anterior. Turno não coletado aparece como aviso no rodapé e não entra como
+zero. O preço-alvo sai do preço do rival que levou a buy box. Se o seller já
+estava mais barato, o texto aponta frete, prazo e reputação em vez de mandar
+baixar o preço.
+
 ## Como sincronizar depois de uma mudança no RAC-Position-tracker
 
 ```bash
