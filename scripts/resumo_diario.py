@@ -67,6 +67,11 @@ JANELA_DIAS = 7
 PIORA_BUSCA_MIN = 5       # posições, mesma régua do alerta do painel
 TURNOS_SOZINHO_MIN = 3    # turnos seguidos como único vendedor
 
+#: Tipos de ação, na ordem de prioridade do resumo. O rótulo é o que a aba do
+#: painel mostra no filtro.
+TIPOS_ACAO = {"perda": "Buy box perdida", "busca": "Queda na busca",
+              "sozinho": "Único vendedor no anúncio"}
+
 
 # ── Leitura ──────────────────────────────────────────────────────────────────
 @dataclass
@@ -310,7 +315,7 @@ def _acoes_sozinho(limpo: pd.DataFrame) -> list[Acao]:
 def _escolher(acoes: list[Acao], n: int) -> list[Acao]:
     """Uma de cada tipo primeiro (perda > busca > sozinho), depois completa com
     as perdas de maior valor. Três perdas iguais dizem menos que três frentes."""
-    prioridade = ["perda", "busca", "sozinho"]
+    prioridade = list(TIPOS_ACAO)
     por_tipo = {t: sorted([a for a in acoes if a.tipo == t], key=lambda a: -a.peso)
                 for t in prioridade}
     escolhidas = [por_tipo[t][0] for t in prioridade if por_tipo[t]][:n]
@@ -332,7 +337,9 @@ def _avisos_cobertura(cobertura: pd.DataFrame, plataformas: set[str],
     return avisos
 
 
-def montar_resumo(seller: str, dados: Dados, n_acoes: int = 3) -> Resumo:
+def montar_resumo(seller: str, dados: Dados, n_acoes: int = 3,
+                  tipos: set[str] | None = None) -> Resumo:
+    """`tipos` restringe as ações a um subconjunto de `TIPOS_ACAO`; None = todas."""
     limpo = _limpo(dados.fato)
     perdidos = dados.perdidos.copy()
     momentos = pd.concat([_momento(limpo), _momento(perdidos)]).dropna()
@@ -352,6 +359,8 @@ def montar_resumo(seller: str, dados: Dados, n_acoes: int = 3) -> Resumo:
         rival = (top.index[0], int(top.iloc[0]))
 
     acoes = _acoes_perda(perdas, limpo) + _acoes_busca(limpo) + _acoes_sozinho(limpo)
+    if tipos is not None:
+        acoes = [a for a in acoes if a.tipo in tipos]
     plataformas = set(limpo["plataforma"].dropna()) | set(perdidos["plataforma"].dropna())
     return Resumo(
         seller=seller, referencia=fim, share_total=total, share_plataformas=por_plat,
@@ -362,7 +371,7 @@ def montar_resumo(seller: str, dados: Dados, n_acoes: int = 3) -> Resumo:
 
 
 # ── Texto ────────────────────────────────────────────────────────────────────
-def formatar(r: Resumo) -> str:
+def formatar(r: Resumo, por_plataforma: bool = True) -> str:
     """Texto com a marcação do WhatsApp (*negrito*, _itálico_)."""
     if r.referencia is None:
         return f"*{r.seller}*\n" + "\n".join(r.avisos)
@@ -373,13 +382,14 @@ def formatar(r: Resumo) -> str:
         pct, delta = r.share_total
         linhas.append(f"*Buy box: {_pct(pct)}*"
                       + (f" ({_pts(delta)} pts)" if delta is not None else ""))
-        for plataforma, p, d in r.share_plataformas:
+        for plataforma, p, d in (r.share_plataformas if por_plataforma else []):
             linhas.append(f"• {plataforma}: {_pct(p)}" + (f" ({_pts(d)})" if d is not None else ""))
     linhas.append(f"• Ganhou {r.ganhos} · Perdeu {r.perdas}")
     if r.rival_top:
         linhas.append(f"• Quem mais te tirou: *{r.rival_top[0]}* ({r.rival_top[1]})")
     if r.acoes:
-        linhas += ["", f"*{len(r.acoes)} ações para hoje*"]
+        rotulo = "ação" if len(r.acoes) == 1 else "ações"
+        linhas += ["", f"*{len(r.acoes)} {rotulo} para hoje*"]
         linhas += [f"{i}. {a.texto}" for i, a in enumerate(r.acoes, 1)]
     else:
         linhas += ["", "Nenhuma ação urgente hoje. Buy box estável."]
