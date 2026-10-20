@@ -108,6 +108,20 @@ zero. O preço-alvo sai do preço do rival que levou a buy box. Se o seller já
 estava mais barato, o texto aponta frete, prazo e reputação em vez de mandar
 baixar o preço.
 
+### Dentro do painel
+
+A aba **📲 Resumo para WhatsApp** do `streamlit_app.py` gera o mesmo texto sem
+precisar rodar nada local: escolha um ou mais sellers (só na instância sem
+`SELLER` travado), o dia de referência, o máximo de ações e os tipos de ação,
+e copie cada quadro pelo ícone no canto. O filtro de plataforma da sidebar vale
+para ela também. A aba importa `scripts/resumo_diario.py` em vez de copiar a
+lógica, então o texto do painel e o do script são sempre iguais.
+
+**Atenção na sincronização abaixo:** o `seller_app/app.py` do
+RAC-Position-tracker ainda não tem esta aba. Copiar aquele arquivo por cima do
+`streamlit_app.py` apaga a aba. Leve a mudança para lá antes da próxima
+sincronização, junto com `scripts/resumo_diario.py`.
+
 ## Como sincronizar depois de uma mudança no RAC-Position-tracker
 
 ```bash

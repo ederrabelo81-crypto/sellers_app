@@ -95,6 +95,13 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+# Resumo diário: a mesma lógica do script de linha de comando, importada em vez
+# de copiada, para o texto da aba e o do script nunca divergirem.
+from scripts.resumo_diario import JANELA_DIAS as _RESUMO_DIAS
+from scripts.resumo_diario import TIPOS_ACAO, montar_resumo
+from scripts.resumo_diario import Dados as DadosResumo
+from scripts.resumo_diario import formatar as formatar_resumo
+
 # ── Logging estruturado ──────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -1690,6 +1697,69 @@ def render_aba_ranking(mercado: pd.DataFrame, share: pd.DataFrame, seller: str) 
         )
 
 
+# ── Aba Resumo para WhatsApp ─────────────────────────────────────────────────
+def render_aba_resumo(seller: str, mercado: pd.DataFrame, plataformas: list[str]) -> None:
+    """Texto do resumo diário de um ou mais sellers, pronto para copiar.
+
+    Lê a sua própria janela (pelo menos `_RESUMO_DIAS` dias), e não a da
+    sidebar: com a janela mínima de 3 dias o "dia observado anterior" do share
+    e o "único vendedor há N turnos" ficariam sem histórico. O filtro de
+    plataforma da sidebar vale aqui também, como em todas as abas.
+    """
+    st.markdown(
+        "Texto pronto para colar no WhatsApp do seller: buy box com variação, "
+        "ganhos e perdas das últimas 24h, o rival que mais tirou buy box e as "
+        "ações do dia. Use o ícone de copiar no canto de cada quadro."
+    )
+    travado = st.secrets.get("SELLER")
+    if travado or mercado.empty:
+        escolhidos = [seller]
+    else:
+        lista = (mercado.groupby("seller_canonical")["produtos_detidos"]
+                 .sum().sort_values(ascending=False).index.tolist())
+        escolhidos = st.multiselect(
+            "Sellers", lista, default=[seller] if seller in lista else [],
+            max_selections=10, key="resumo_sellers",
+            help="Um quadro por seller, para copiar e mandar um a um.")
+
+    desde = date.today() - timedelta(days=_RESUMO_DIAS)
+    c1, c2, c3 = st.columns([1, 1, 2])
+    dia = c1.date_input(
+        "Dia de referência", value=date.today(), min_value=desde,
+        max_value=date.today(), format="DD/MM/YYYY", key="resumo_dia",
+        help="O resumo usa a última leitura até este dia e as 24h antes dela.")
+    n_acoes = c2.slider("Máximo de ações", 1, 5, 3, key="resumo_n")
+    tipos = c3.multiselect(
+        "Tipos de ação", list(TIPOS_ACAO), default=list(TIPOS_ACAO),
+        format_func=TIPOS_ACAO.get, key="resumo_tipos")
+    por_plataforma = st.toggle("Mostrar buy box por plataforma", value=True,
+                               key="resumo_plat")
+
+    if not escolhidos:
+        st.info("Escolha pelo menos um seller.")
+        return
+    corte = pd.Timestamp(dia)
+    for nome in escolhidos:
+        try:
+            fato, share, cobertura = carregar(nome, desde)
+            perdidos = carregar_perdidos(nome, desde)
+        except Exception as e:
+            logger.error(f"Erro ao montar resumo de {nome}: {e}")
+            st.error(f"Não foi possível carregar **{nome}** agora ({e}).")
+            continue
+        quadros = [fato, perdidos, share, cobertura]
+        if plataformas:
+            quadros = [q[q["plataforma"].isin(plataformas)] for q in quadros]
+        dados = DadosResumo(*(q[q["data"] <= corte] for q in quadros))
+        texto = formatar_resumo(montar_resumo(nome, dados, n_acoes, set(tipos)),
+                                por_plataforma=por_plataforma)
+        st.markdown(f"##### {nome}")
+        st.code(texto, language=None)
+    if plataformas:
+        st.caption("Recortado nas plataformas escolhidas na sidebar: "
+                   + ", ".join(plataformas) + ".")
+
+
 # ── Aba Cobertura ────────────────────────────────────────────────────────────
 def render_calendar_heatmap(cobertura: pd.DataFrame) -> None:
     """Renderiza calendar heatmap para cobertura."""
@@ -1926,9 +1996,9 @@ def main() -> None:
                 for nivel, texto in alertas:
                     {"erro": st.error, "aviso": st.warning}.get(nivel, st.info)(texto)
 
-    aba1, aba2, aba3, aba4, aba5 = st.tabs([
+    aba1, aba2, aba3, aba4, aba5, aba6 = st.tabs([
         "📈 Share de buy box", "🏆 Ganhos e perdas", "🏷️ Marcas e posição",
-        "🥊 Ranking na plataforma", "🩺 Cobertura",
+        "🥊 Ranking na plataforma", "🩺 Cobertura", "📲 Resumo para WhatsApp",
     ])
 
     with aba1:
@@ -1952,6 +2022,9 @@ def main() -> None:
 
         # Calendar heatmap
         render_calendar_heatmap(cobertura)
+
+    with aba6:
+        render_aba_resumo(seller, mercado, escolha)
 
     suspeitas = int(_sim(fato["identidade_suspeita"]).sum()) if not vazio else 0
     if suspeitas:
